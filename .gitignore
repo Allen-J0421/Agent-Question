@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Virtualenvs
+.venv/
+.venv-interactive-swe/
+
+# Harness outputs (large / regenerable) — track code, not run artifacts
+runs/
+repos/
+.worktrees/
+eval_logs/
+logs/
+runs_table.csv
+runs_table.parquet
+
+# Keep manifests (frozen samples) and fixtures under version control
+!manifests/
+!tests/fixtures/
+
+# Large dataset binary — the immutable research input, stored separately (not in git
+# history). Keep the human-readable schema/README for reference.
+data/interactive-swe/test/*.arrow
+
+# OS / editor
+.DS_Store
+.ipynb_checkpoints/
