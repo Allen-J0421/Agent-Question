@@ -1,0 +1,30 @@
+{
+  "name": "pilot_20",
+  "n": 20,
+  "instance_ids": [
+    "astropy__astropy-13579",
+    "django__django-15268",
+    "pydata__xarray-3993",
+    "pydata__xarray-6992",
+    "pylint-dev__pylint-8898",
+    "pytest-dev__pytest-5787",
+    "scikit-learn__scikit-learn-25102",
+    "sphinx-doc__sphinx-9229",
+    "sphinx-doc__sphinx-7590",
+    "sympy__sympy-13852",
+    "sympy__sympy-13878",
+    "astropy__astropy-14995",
+    "django__django-12308",
+    "matplotlib__matplotlib-20859",
+    "mwaskom__seaborn-3187",
+    "pallets__flask-5014",
+    "psf__requests-1142",
+    "pydata__xarray-4356",
+    "pylint-dev__pylint-6903",
+    "pytest-dev__pytest-7982"
+  ],
+  "meta": {
+    "n": 20,
+    "seed": 42
+  }
+}

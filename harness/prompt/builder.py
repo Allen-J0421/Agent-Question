@@ -17,11 +17,7 @@ from harness.record.schema import PromptInfo
 
 # Identical across conditions. Deliberately does not mention clarifying questions.
 _TASK_TEMPLATE = """\
-You are working in a checkout of the {repo} repository. A GitHub issue has been \
-filed that needs to be resolved by editing the code in this repository.
-
-Resolve the issue described below. Make the necessary code changes so the reported \
-problem is fixed. Do not modify test files.
+You are working in a checkout of the {repo} repository. Resolve the issue described below. Do not modify test files.
 
 --- ISSUE ---
 {issue_text}

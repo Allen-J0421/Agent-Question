@@ -33,7 +33,7 @@ class PathsConfig:
 @dataclass(frozen=True)
 class RunConfig:
     """Parameters controlling a single Claude-CLI agent run."""
-    model: str = os.environ.get("HARNESS_MODEL", "opus")
+    model: str = os.environ.get("HARNESS_MODEL", "claude-opus-4-8")
     permission_mode: str = "acceptEdits"   # edit files in the sandbox without prompts
     max_turns: int = 40
     wall_timeout_s: int = 1800             # kill a run after 30 min
