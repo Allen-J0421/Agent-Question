@@ -54,7 +54,10 @@ class EvalConfig:
     cache_level: str = "env"       # keep env images, discard instance images
     force_rebuild: bool = False
     timeout_s: int = 1800
-    namespace: str | None = None   # None => build locally instead of pulling swebench.ci
+    # "swebench" => PULL prebuilt images from the published registry instead of building
+    # locally. Verified on an 8 GB machine: local builds OOM at the conda step, but
+    # pulling + running the prebuilt image fits (gold-patch check reports resolved=True).
+    namespace: str | None = "swebench"
     run_id_prefix: str = "ambigswe"
 
 
