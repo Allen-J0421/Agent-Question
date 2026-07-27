@@ -1,0 +1,224 @@
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import study_log
+
+
+def _timestamp(offset: int = 0) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=offset)).isoformat()
+
+
+def _tool_record(cwd: Path, timestamp: str, name: str, tool_id: str, caller="direct"):
+    return {
+        "timestamp": timestamp,
+        "cwd": str(cwd),
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": name,
+                    "id": tool_id,
+                    "caller": {"type": caller},
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "What behavior should this have?",
+                                "options": [{"label": "A"}, {"label": "B"}],
+                            }
+                        ]
+                    }
+                    if name == "AskUserQuestion"
+                    else {},
+                }
+            ]
+        },
+    }
+
+
+def _write_jsonl(path: Path, records: list[dict], malformed: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(record) for record in records]
+    if malformed:
+        lines.append("{not json}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_transcript_analysis_counts_direct_and_subagent_asks_separately(tmp_path):
+    projects = tmp_path / "projects"
+    workspace = tmp_path / "checkout"
+    workspace.mkdir()
+    started = _timestamp(-1)
+    root = projects / "project" / "root.jsonl"
+    subagent = projects / "project" / "subagents" / "worker.jsonl"
+    _write_jsonl(
+        root,
+        [
+            _tool_record(workspace, _timestamp(0), "Read", "read-1"),
+            _tool_record(workspace, _timestamp(1), "AskUserQuestion", "ask-1"),
+            _tool_record(workspace, _timestamp(2), "AskUserQuestion", "ask-1"),
+        ],
+        malformed=True,
+    )
+    _write_jsonl(
+        subagent,
+        [_tool_record(workspace, _timestamp(3), "AskUserQuestion", "ask-sub")],
+    )
+
+    analysis = study_log.analyze_transcripts([root, subagent], projects, started)
+
+    assert analysis["direct_count"] == 1
+    assert analysis["any_agent_count"] == 2
+    assert analysis["parse_errors"] == 1
+    assert analysis["first_direct"]["assistant_tool_actions_before"] == 1
+    assert analysis["first_direct"]["tool_use_id"] == "ask-1"
+
+
+def test_find_workspace_transcripts_uses_recorded_cwd(tmp_path):
+    projects = tmp_path / "projects"
+    workspace = tmp_path / "checkout"
+    other_workspace = tmp_path / "other"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    started = _timestamp(-1)
+    matching = projects / "one" / "match.jsonl"
+    other = projects / "two" / "other.jsonl"
+    _write_jsonl(matching, [_tool_record(workspace, _timestamp(0), "Read", "one")])
+    _write_jsonl(other, [_tool_record(other_workspace, _timestamp(0), "Read", "two")])
+
+    assert study_log.find_workspace_transcripts(projects, workspace, started) == [matching]
+
+
+def test_observer_interrupts_once_on_first_direct_ask(monkeypatch, tmp_path):
+    class Process:
+        pid = 123
+        done = False
+
+        def poll(self):
+            return 130 if self.done else None
+
+        def wait(self, timeout=None):
+            self.done = True
+            return 130
+
+    process = Process()
+    launches = []
+    interrupts = []
+    analysis = {
+        "paths": [],
+        "parse_errors": 0,
+        "valid_records": 1,
+        "first_direct": {"tool_use_id": "ask-1"},
+        "direct_count": 1,
+        "any_agent_count": 1,
+    }
+    monkeypatch.setattr(
+        study_log.subprocess,
+        "Popen",
+        lambda *args, **kwargs: launches.append((args, kwargs)) or process,
+    )
+    monkeypatch.setattr(study_log, "find_workspace_transcripts", lambda *args: [])
+    monkeypatch.setattr(study_log, "analyze_transcripts", lambda *args: analysis)
+    monkeypatch.setattr(study_log.time, "sleep", lambda _: None)
+
+    def stop(pid, sig=study_log.signal.SIGINT):
+        interrupts.append((pid, sig))
+        process.done = True
+
+    monkeypatch.setattr(study_log, "interrupt_process_group", stop)
+    result = study_log.observe_headless_session(
+        ["claude", "--model", "model", "PROMPT"],
+        tmp_path,
+        _timestamp(-1),
+        tmp_path / "projects",
+        tmp_path / "output",
+    )
+
+    assert launches[0][0][0] == ["claude", "--model", "model", "PROMPT"]
+    assert launches[0][1]["start_new_session"] is True
+    assert launches[0][1]["stdin"] is study_log.subprocess.DEVNULL
+    assert interrupts == [(123, study_log.signal.SIGINT)]
+    assert result["stop_reason"] == "stopped_on_first_ask"
+    assert Path(result["process_output"]["stdout"]).exists()
+
+
+def test_interrupt_process_group_targets_only_child_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+
+    study_log.interrupt_process_group(42)
+
+    assert calls == [(42, study_log.signal.SIGINT)]
+
+
+def test_unmatched_or_malformed_transcript_is_unknown(tmp_path):
+    logs_root = tmp_path / "logs"
+    manifest = {
+        "run_id": "unknown-run",
+        "started_at": _timestamp(-1),
+        "task": {"instance_id": "one", "condition": "ambiguous"},
+        "claude": {"model": "model"},
+        "workspace": str(tmp_path),
+    }
+    observation = {
+        "exit_code": 0,
+        "stop_reason": "completed",
+        "operator_interrupted": False,
+        "analysis": {
+            "paths": [],
+            "parse_errors": 1,
+            "valid_records": 0,
+            "first_direct": None,
+            "direct_count": 0,
+            "any_agent_count": 0,
+        },
+    }
+
+    summary = study_log.build_run_summary(manifest, observation, logs_root)
+
+    assert summary["ask_user_question"]["direct_asked"] is None
+    assert summary["transcript"]["monitoring_status"] == "unknown"
+
+
+def _summary(run_id: str, asked: bool | None) -> dict:
+    first = None
+    if asked:
+        first = {
+            "assistant_tool_actions_before": 2,
+            "input": {"questions": [{"options": [{}, {}]}]},
+        }
+    return {
+        "run_id": run_id,
+        "task": {"instance_id": run_id, "condition": "ambiguous"},
+        "claude": {"model": "claude-opus-4-8"},
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "ended_at": "2026-01-01T00:01:00+00:00",
+        "process": {"exit_code": 0, "stop_reason": "completed"},
+        "transcript": {"monitoring_status": "complete_no_ask"},
+        "ask_user_question": {
+            "direct_asked": asked,
+            "direct_count": int(asked is True),
+            "any_agent_count": int(asked is True),
+            "first_direct": first,
+            "first_direct_latency_seconds": 3.0 if asked else None,
+        },
+    }
+
+
+def test_report_writes_csv_json_and_markdown(tmp_path):
+    logs_root = tmp_path / "logs"
+    study_log.write_run_summary(logs_root, _summary("asked", True))
+    study_log.write_run_summary(logs_root, _summary("not-asked", False))
+    study_log.write_run_summary(logs_root, _summary("unknown", None))
+
+    paths = study_log.write_report(logs_root)
+    report = json.loads(paths["json"].read_text(encoding="utf-8"))
+
+    assert report["runs"]["total"] == 3
+    assert report["runs"]["valid_for_primary_outcome"] == 2
+    assert report["runs"]["direct_ask_rate"] == 0.5
+    assert "direct_asked" in paths["csv"].read_text(encoding="utf-8")
+    assert "Direct AskUserQuestion runs: 1 (50.0%)" in paths["markdown"].read_text(
+        encoding="utf-8"
+    )

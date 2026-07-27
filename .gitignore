@@ -8,18 +8,11 @@ __pycache__/
 .venv/
 .venv-interactive-swe/
 
-# Harness outputs (large / regenerable) — track code, not run artifacts
-runs/
-repos/
-.worktrees/
-eval_logs/
-logs/
-runs_table.csv
-runs_table.parquet
+# Repository checkouts created by the minimal interactive launcher
+.experiment-checkouts/
 
-# Keep manifests (frozen samples) and fixtures under version control
-!manifests/
-!tests/fixtures/
+# Immutable Claude session copies and derived AskUserQuestion study reports
+.experiment-logs/
 
 # Large dataset binary — the immutable research input, stored separately (not in git
 # history). Keep the human-readable schema/README for reference.
