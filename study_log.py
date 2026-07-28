@@ -487,6 +487,19 @@ def build_run_summary_sdk(
     result = observation.get("result") or {}
     direct_asked = first is not None
 
+    actual_tools = observation.get("tool_roster")
+    reference_tools = observation.get("reference_toolset")
+    if actual_tools is not None and reference_tools is not None:
+        actual_set = set(actual_tools)
+        reference_set = set(reference_tools)
+        missing_from_actual = sorted(reference_set - actual_set)
+        extra_in_actual = sorted(actual_set - reference_set)
+        matches_reference = not missing_from_actual and not extra_in_actual
+    else:
+        missing_from_actual = None
+        extra_in_actual = None
+        matches_reference = None
+
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": manifest["run_id"],
@@ -507,6 +520,9 @@ def build_run_summary_sdk(
         "tool_roster": {
             "tools": observation.get("tool_roster"),
             "askuserquestion_available": observation.get("askuserquestion_available"),
+            "matches_reference": matches_reference,
+            "missing_from_actual": missing_from_actual,
+            "extra_in_actual": extra_in_actual,
         },
         "ask_user_question": {
             "direct_asked": direct_asked,
@@ -569,6 +585,13 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
                     if isinstance(question, dict) and isinstance(question.get("options", []), list)
                 )
             )
+    rosters = [
+        summary.get("tool_roster", {})
+        for summary in summaries
+        if isinstance(summary.get("tool_roster", {}).get("matches_reference"), bool)
+    ]
+    mismatched_rosters = [roster for roster in rosters if not roster["matches_reference"]]
+
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
@@ -581,6 +604,20 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
             "direct_ask_rate": direct_ask_runs / len(valid) if valid else None,
             "any_agent_ask_runs": any_agent_ask_runs,
             "any_agent_ask_rate": any_agent_ask_runs / len(summaries) if summaries else None,
+        },
+        "tool_roster": {
+            "checked": len(rosters),
+            "mismatched": len(mismatched_rosters),
+            "mismatch_rate": (
+                len(mismatched_rosters) / len(rosters) if rosters else None
+            ),
+            "mismatched_runs": [
+                {
+                    "missing": roster.get("missing_from_actual"),
+                    "extra": roster.get("extra_in_actual"),
+                }
+                for roster in mismatched_rosters
+            ],
         },
         "secondary": {
             "first_ask_latency_seconds": _numeric_summary(
@@ -663,12 +700,24 @@ def write_report(logs_root: Path) -> dict[str, Path]:
     runs = report["runs"]
     rate = runs["direct_ask_rate"]
     rate_text = "n/a" if rate is None else f"{rate:.1%}"
+    roster = report["tool_roster"]
+    if roster["checked"]:
+        mismatch_rate_text = (
+            "n/a" if roster["mismatch_rate"] is None else f"{roster['mismatch_rate']:.1%}"
+        )
+        roster_line = (
+            f"- Tool roster mismatches: {roster['mismatched']}/{roster['checked']} "
+            f"SDK runs ({mismatch_rate_text}) — see tool_roster.mismatched_runs in the JSON report\n"
+        )
+    else:
+        roster_line = ""
     markdown_path.write_text(
         "# AskUserQuestion report\n\n"
         f"- Runs logged: {runs['total']}\n"
         f"- Valid primary-outcome runs: {runs['valid_for_primary_outcome']}\n"
         f"- Direct AskUserQuestion runs: {runs['direct_ask_runs']} ({rate_text})\n"
-        f"- Unknown runs: {runs['unknown']}\n",
+        f"- Unknown runs: {runs['unknown']}\n"
+        f"{roster_line}",
         encoding="utf-8",
     )
     return {"json": json_path, "csv": csv_path, "markdown": markdown_path}

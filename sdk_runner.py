@@ -134,6 +134,7 @@ async def run_sdk_session(
 
     return {
         "tool_roster": tool_roster,
+        "reference_toolset": tools,
         "askuserquestion_available": bool(
             tool_roster and "AskUserQuestion" in tool_roster
         ),

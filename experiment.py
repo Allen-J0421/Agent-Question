@@ -248,11 +248,18 @@ def command_run(args: argparse.Namespace) -> None:
         summary = build_run_summary_sdk(manifest, observation)
         summary_path = write_run_summary(logs_root, summary)
         print(f"Run log: {summary_path}", flush=True)
+        roster = summary["tool_roster"]
         print(
-            f"AskUserQuestion available this run: "
-            f"{summary['tool_roster']['askuserquestion_available']}",
+            f"AskUserQuestion available this run: {roster['askuserquestion_available']}",
             flush=True,
         )
+        if roster["matches_reference"] is False:
+            print(
+                f"WARNING: live tool roster did not match reference_toolset.json — "
+                f"missing: {roster['missing_from_actual']}, "
+                f"extra: {roster['extra_in_actual']}",
+                flush=True,
+            )
         return
 
     manifest = create_run_manifest(
