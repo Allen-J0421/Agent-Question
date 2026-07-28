@@ -1,0 +1,32 @@
+{
+  "_comment": "Reference tool roster for ambig-SWE SDK sessions. Captured live from claude-agent-sdk ClaudeAgentOptions(tools={'type': 'preset', 'preset': 'claude_code'}, strict_mcp_config=True, mcp_servers={}) against claude-agent-sdk 0.2.128 on 2026-07-28. This is the stock default Claude Code toolset with this machine's personal MCP servers (Gmail/Calendar/Drive) excluded via strict_mcp_config, so the roster reflects a standard install rather than this developer's account-specific extras. AskUserQuestion is added explicitly because it requires a registered can_use_tool callback to appear in the live roster at all (see docs.claude.com/agent-sdk/user-input) -- it is otherwise part of the standard toolset and its absence from the raw preset capture is a client-construction artifact, not an intentional exclusion.",
+  "preset_source": "claude_code",
+  "strict_mcp_config": true,
+  "tools": [
+    "AskUserQuestion",
+    "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "Edit",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Monitor",
+    "NotebookEdit",
+    "PushNotification",
+    "Read",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TaskStop",
+    "TodoWrite",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Write"
+  ]
+}

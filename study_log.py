@@ -56,12 +56,25 @@ def create_run_manifest(
     row: dict[str, Any],
     condition: str,
     model: str,
-    claude_bin: str,
     workspace: Path,
     prompt: str,
+    interface: str = "cli",
+    claude_bin: str | None = None,
 ) -> dict[str, Any]:
-    """Persist immutable pre-launch metadata and return the manifest."""
+    """Persist immutable pre-launch metadata and return the manifest.
+
+    ``interface`` is ``"cli"`` (subprocess ``claude -p``, no callback
+    mechanism -- AskUserQuestion is structurally unreachable there) or
+    ``"sdk"`` (Agent SDK session with a ``can_use_tool`` callback, required
+    for AskUserQuestion to appear in the tool roster at all). Every summary
+    is stamped with this so historical CLI-path runs and current SDK-path
+    runs are never silently conflated in analysis.
+    """
     run_id = str(uuid.uuid4())
+    claude_info: dict[str, Any] = {"model": model, "interface": interface}
+    if interface == "cli":
+        claude_info["binary"] = claude_bin
+        claude_info["argv_shape"] = ["claude", "--model", model, "<prompt>"]
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -74,11 +87,7 @@ def create_run_manifest(
             "condition": condition,
             "prompt_sha256": prompt_hash(prompt),
         },
-        "claude": {
-            "binary": claude_bin,
-            "model": model,
-            "argv_shape": ["claude", "--model", model, "<prompt>"],
-        },
+        "claude": claude_info,
         "workspace": str(workspace.resolve()),
     }
     write_new_json(logs_root / "manifests" / f"{run_id}.json", manifest)
@@ -433,6 +442,78 @@ def build_run_summary(
             "any_agent_count": analysis["any_agent_count"],
             "first_direct": first_summary,
             "first_direct_latency_seconds": latency,
+        },
+    }
+
+
+def build_run_summary_sdk(
+    manifest: dict[str, Any], observation: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a run summary from an ``sdk_runner.run_sdk_session`` observation.
+
+    Distinct from ``build_run_summary`` (which analyzes CLI transcript
+    files) because the SDK path observes ``AskUserQuestion`` directly
+    through its ``can_use_tool`` callback -- there is no transcript to tail,
+    and no way for a run to be ``unknown`` the way a missing/malformed CLI
+    transcript could be. The top-level schema matches
+    ``build_run_summary`` wherever the underlying data is genuinely the
+    same, and adds ``tool_roster`` / ``askuserquestion_available`` so every
+    run is self-certifying instead of relying on an assumption about
+    whether the tool was reachable.
+    """
+    analysis = observation["analysis"]
+    first = analysis["first_direct"]
+    first_summary = dict(first) if first is not None else None
+    if first_summary is not None:
+        payload = first_summary.get("input")
+        questions = payload.get("questions") if isinstance(payload, dict) else None
+        if isinstance(questions, list):
+            first_summary["question_count"] = len(questions)
+            first_summary["option_count"] = sum(
+                len(question.get("options", []))
+                for question in questions
+                if isinstance(question, dict) and isinstance(question.get("options", []), list)
+            )
+
+    started = _parse_timestamp(manifest["started_at"])
+    ended_at = utc_now()
+    ended = _parse_timestamp(ended_at)
+    duration = (
+        (ended - started).total_seconds()
+        if started is not None and ended is not None
+        else None
+    )
+
+    result = observation.get("result") or {}
+    direct_asked = first is not None
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": manifest["run_id"],
+        "started_at": manifest["started_at"],
+        "ended_at": ended_at,
+        "task": manifest["task"],
+        "claude": manifest["claude"],
+        "workspace": manifest["workspace"],
+        "process": {
+            "exit_code": 1 if result.get("is_error") else 0,
+            "stop_reason": result.get("stop_reason") or result.get("subtype"),
+            "operator_interrupted": False,
+            "duration_seconds": duration,
+            "sdk_session_id": result.get("session_id"),
+            "sdk_num_turns": result.get("num_turns"),
+            "sdk_total_cost_usd": result.get("total_cost_usd"),
+        },
+        "tool_roster": {
+            "tools": observation.get("tool_roster"),
+            "askuserquestion_available": observation.get("askuserquestion_available"),
+        },
+        "ask_user_question": {
+            "direct_asked": direct_asked,
+            "direct_count": analysis["direct_count"],
+            "any_agent_count": analysis["any_agent_count"],
+            "first_direct": first_summary,
+            "first_direct_latency_seconds": None,
         },
     }
 

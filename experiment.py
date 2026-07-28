@@ -8,6 +8,7 @@ requested model.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import shutil
 import subprocess
 from functools import lru_cache
@@ -15,8 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from datasets import load_from_disk
+from sdk_runner import load_reference_toolset, run_sdk_session
 from study_log import (
     build_run_summary,
+    build_run_summary_sdk,
     create_run_manifest,
     default_logs_root,
     load_run_summaries,
@@ -186,32 +189,72 @@ def command_run(args: argparse.Namespace) -> None:
     row = rows[args.instance_id]
     field = CONDITION_FIELD[args.condition]
     prompt = build_prompt(row, args.condition)
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        raise SystemExit("claude CLI not found on PATH")
+    interface = getattr(args, "interface", "sdk")
+
+    claude_bin = None
+    if interface == "cli":
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise SystemExit("claude CLI not found on PATH")
 
     print(f"Instance:  {row['instance_id']}")
     print(f"Repository:{row['repo']}")
     print(f"Condition: {args.condition}")
     print(f"Field:     {field}")
     print(f"Model:     {args.model}")
+    print(f"Interface: {interface}")
     print("\n--- EXACT CLAUDE PROMPT ---")
     print(prompt)
     print("--- END PROMPT ---\n")
 
     if args.dry_run:
         print("Dry run: Claude was not launched.")
-        print(
-            "Command shape: claude --model",
-            args.model,
-            "-p --permission-mode bypassPermissions \"<prompt>\"",
-        )
+        if interface == "sdk":
+            print(
+                "Command shape: Agent SDK session, permission_mode=bypassPermissions, "
+                "tools=<config/reference_toolset.json>, can_use_tool callback registered "
+                "(required for AskUserQuestion to appear in the roster)."
+            )
+        else:
+            print(
+                "Command shape: claude --model",
+                args.model,
+                "-p --permission-mode bypassPermissions \"<prompt>\"",
+            )
         return
 
     workspace = prepare_workspace(row, args.condition)
-    argv = claude_argv(claude_bin, args.model, prompt)
-    print(f"Launching unattended Claude Code in {workspace}", flush=True)
+    print(f"Launching unattended Claude Code ({interface}) in {workspace}", flush=True)
     logs_root = Path(args.logs_dir) if args.logs_dir else default_logs_root()
+
+    if interface == "sdk":
+        manifest = create_run_manifest(
+            logs_root,
+            row=row,
+            condition=args.condition,
+            model=args.model,
+            workspace=workspace,
+            prompt=prompt,
+            interface="sdk",
+        )
+        observation = asyncio.run(
+            run_sdk_session(
+                prompt=prompt,
+                workspace=workspace,
+                model=args.model,
+                tools=load_reference_toolset(),
+            )
+        )
+        summary = build_run_summary_sdk(manifest, observation)
+        summary_path = write_run_summary(logs_root, summary)
+        print(f"Run log: {summary_path}", flush=True)
+        print(
+            f"AskUserQuestion available this run: "
+            f"{summary['tool_roster']['askuserquestion_available']}",
+            flush=True,
+        )
+        return
+
     manifest = create_run_manifest(
         logs_root,
         row=row,
@@ -220,7 +263,9 @@ def command_run(args: argparse.Namespace) -> None:
         claude_bin=claude_bin,
         workspace=workspace,
         prompt=prompt,
+        interface="cli",
     )
+    argv = claude_argv(claude_bin, args.model, prompt)
     try:
         observation = observe_headless_session(
             argv,
@@ -300,6 +345,7 @@ def command_batch(args: argparse.Namespace) -> None:
                         model=args.model,
                         dry_run=args.dry_run,
                         logs_dir=args.logs_dir,
+                        interface=args.interface,
                     )
                 )
         except KeyboardInterrupt:
@@ -328,6 +374,17 @@ def parser() -> argparse.ArgumentParser:
         "--logs-dir",
         help="directory for Git-ignored run manifests, transcripts, and summaries",
     )
+    run.add_argument(
+        "--interface",
+        choices=("sdk", "cli"),
+        default="sdk",
+        help=(
+            "sdk (default): Agent SDK session with a can_use_tool callback, "
+            "required for AskUserQuestion to appear in the tool roster at all. "
+            "cli: subprocess `claude -p`, which has no callback mechanism and "
+            "cannot resolve an AskUserQuestion call -- kept only for comparison."
+        ),
+    )
     run.set_defaults(func=command_run)
 
     batch = sub.add_parser(
@@ -351,6 +408,12 @@ def parser() -> argparse.ArgumentParser:
     batch.add_argument(
         "--logs-dir",
         help="directory whose run summaries define resume state",
+    )
+    batch.add_argument(
+        "--interface",
+        choices=("sdk", "cli"),
+        default="sdk",
+        help="see `run --interface` for the difference; applies to every session in the batch",
     )
     batch.set_defaults(func=command_batch)
 
