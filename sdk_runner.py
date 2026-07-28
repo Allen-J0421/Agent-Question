@@ -1,17 +1,25 @@
 """Run one unattended Claude Code session via the Agent SDK.
 
-Unlike the CLI's ``-p`` mode (which has no callback mechanism at all),
-this module registers a ``can_use_tool`` callback -- required for
-``AskUserQuestion`` to appear in the session's tool roster in the first
-place, confirmed by direct testing against the live backend. The callback
-observes every ``AskUserQuestion`` call (full question/options/timing) and
-answers with a neutral first-option tie-break so a headless run can
-complete; every other tool is auto-approved unchanged, matching
-``bypassPermissions`` semantics as closely as the SDK allows.
+The session runs in ``default`` permission mode, so the ``can_use_tool``
+callback is a genuine permission prompt: every tool call the CLI's rules
+evaluate to "ask" reaches it, and the agent experiences the same friction
+points an attended session has. This matters for the study's outcome --
+under ``bypassPermissions`` the callback is shadowed for ordinary tools
+(the SDK emits ``CanUseToolShadowedWarning``), the agent never pauses,
+and it can resolve any ambiguity by reading the repository instead of
+asking about it.
+
+The callback approves every ordinary tool automatically -- no run is
+gated on a human -- while recording the approval, so "the agent had to
+stop here" is observable rather than removed. ``AskUserQuestion`` calls
+are logged in full (question/options/timing) and answered with a neutral
+first-option tie-break so a headless run can complete.
 """
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +29,8 @@ from claude_agent_sdk.types import PermissionResultAllow
 
 ROOT = Path(__file__).resolve().parent
 REFERENCE_TOOLSET_PATH = ROOT / "config" / "reference_toolset.json"
+
+PERMISSION_MODE = "default"
 
 
 def load_reference_toolset() -> list[str]:
@@ -49,18 +59,25 @@ async def run_sdk_session(
     workspace: Path,
     model: str,
     tools: list[str] | None = None,
+    stop_on_first_ask: bool = True,
 ) -> dict[str, Any]:
     """Run one headless SDK session and return a structured observation.
 
-    Mirrors the shape ``study_log.observe_headless_session`` used to return
-    from CLI transcript-tailing, so ``build_run_summary`` can stay largely
+    Mirrors the shape ``study_log.observe_headless_session`` returns from
+    CLI transcript-tailing, so ``build_run_summary`` can stay largely
     unchanged: ``analysis.first_direct``, ``analysis.direct_count``,
-    ``analysis.any_agent_count``, plus a new ``tool_roster`` /
-    ``askuserquestion_available`` pair that makes every run self-certifying.
+    ``analysis.any_agent_count``, plus ``tool_roster`` /
+    ``askuserquestion_available`` so every run is self-certifying.
+
+    ``stop_on_first_ask`` ends the session once the main thread asks its
+    first question, matching the CLI path's ``stopped_on_first_ask``
+    behavior so the two interfaces measure the same thing.
     """
     tools = tools if tools is not None else load_reference_toolset()
 
-    events: list[dict[str, Any]] = []
+    started_monotonic = time.monotonic()
+    started_at = datetime.now(timezone.utc)
+
     tool_roster: list[str] | None = None
     main_tool_actions = 0
     direct_ids: set[str] = set()
@@ -68,10 +85,13 @@ async def run_sdk_session(
     first_direct: dict[str, Any] | None = None
     direct_count = 0
     any_agent_count = 0
+    permission_prompts = 0
     result_message: dict[str, Any] | None = None
+    stopped_on_first_ask = False
 
     async def can_use_tool(tool_name, input_data, context):
-        nonlocal main_tool_actions, first_direct, direct_count, any_agent_count
+        nonlocal main_tool_actions, first_direct, direct_count
+        nonlocal any_agent_count, permission_prompts
 
         is_subagent = context.agent_id is not None
         is_ask = tool_name == "AskUserQuestion"
@@ -86,10 +106,14 @@ async def run_sdk_session(
                     direct_ids.add(identifier)
                     direct_count += 1
                     if first_direct is None:
+                        now = time.monotonic()
                         first_direct = {
                             "tool_use_id": identifier,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "latency_seconds": now - started_monotonic,
                             "input": input_data,
                             "assistant_tool_actions_before": main_tool_actions,
+                            "permission_prompts_before": permission_prompts,
                         }
             questions = input_data.get("questions") or []
             answers = _first_option_answers(questions)
@@ -97,6 +121,9 @@ async def run_sdk_session(
                 updated_input={"questions": questions, "answers": answers}
             )
 
+        # Reaching here means the CLI's permission rules evaluated to "ask"
+        # for an ordinary tool: a real friction point in default mode.
+        permission_prompts += 1
         if not is_subagent:
             main_tool_actions += 1
         return PermissionResultAllow(updated_input=input_data)
@@ -104,7 +131,7 @@ async def run_sdk_session(
     options = ClaudeAgentOptions(
         cwd=str(workspace),
         model=model,
-        permission_mode="bypassPermissions",
+        permission_mode=PERMISSION_MODE,
         tools=tools,
         strict_mcp_config=True,
         mcp_servers={},
@@ -131,14 +158,27 @@ async def run_sdk_session(
                     "total_cost_usd": message.total_cost_usd,
                     "result": message.result,
                 }
+            if stop_on_first_ask and first_direct is not None:
+                # The primary outcome is already recorded; everything after
+                # the first ask is shaped by the synthetic answer, so stop.
+                await client.interrupt()
+                stopped_on_first_ask = True
+                break
+
+    ended_at = datetime.now(timezone.utc)
 
     return {
         "tool_roster": tool_roster,
         "reference_toolset": tools,
+        "permission_mode": PERMISSION_MODE,
         "askuserquestion_available": bool(
             tool_roster and "AskUserQuestion" in tool_roster
         ),
         "result": result_message,
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "stopped_on_first_ask": stopped_on_first_ask,
+        "permission_prompts": permission_prompts,
         "analysis": {
             "first_direct": first_direct,
             "direct_count": direct_count,

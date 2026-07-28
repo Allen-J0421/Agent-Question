@@ -7,20 +7,17 @@ There is no tool allowlist beyond the standard Claude Code toolset
 (`config/reference_toolset.json`), no custom system prompt, no patch evaluator, and
 no Docker integration.
 
-**Default interface: the Claude Agent SDK** (`--interface sdk`, the default for both
-`run` and `batch`). A `can_use_tool` callback is registered — this is required for
-`AskUserQuestion` to appear in the session's tool roster at all, confirmed by direct
-testing; without a callback, the tool is silently absent even when named explicitly.
-The callback logs every `AskUserQuestion` call in full (question, options, timing)
-and answers with a neutral first-option tie-break so the run can complete headlessly.
-Every other tool is auto-approved unchanged (`bypassPermissions`). See
-`PREREGISTRATION.md` for the full rationale, scope limitations, and outcome
-definitions.
+Sessions run through the **Claude Agent SDK** in `default` permission mode with a
+`can_use_tool` callback registered. Tool calls that would prompt reach the callback,
+which records them and approves them, so the agent hits the same friction points an
+attended session has but no run is gated on a human. `AskUserQuestion` calls are
+logged in full (question, options, timing) and answered with a neutral first-option
+tie-break; the session stops at the first main-thread ask.
 
-A legacy CLI path (`--interface cli`, plain `claude -p --permission-mode
-bypassPermissions`) is kept for comparison. It has no callback mechanism, so
-`AskUserQuestion` is structurally unreachable there — this is *why* the SDK path
-exists, not an equivalent alternative.
+`bypassPermissions` is deliberately not used: it shadows `can_use_tool` for ordinary
+tools, so the agent never pauses and can resolve an under-specified issue by reading
+the repository instead of asking. See `PREREGISTRATION.md` for the full rationale,
+scope limitations, and outcome definitions.
 
 ## Dataset fields
 
@@ -61,24 +58,16 @@ The launcher prepares a normal GitHub checkout under the Git-ignored
 `.experiment-checkouts/` subdirectory of the directory where you invoke it, checks
 out the instance's `base_commit`, and then launches a session against it.
 
-By default (`--interface sdk`) this is an Agent SDK session: `permission_mode`
-`bypassPermissions`, `tools` set to `config/reference_toolset.json`, and a
-`can_use_tool` callback that observes and answers `AskUserQuestion` calls (see
+Each session is an Agent SDK session: `permission_mode` `default`, `tools` set to
+`config/reference_toolset.json`, and a `can_use_tool` callback that records and
+approves prompting tool calls and observes `AskUserQuestion` (see
 `PREREGISTRATION.md`). No hooks, no plan mode, no prompt telling Claude to ask.
-Every run's summary records the exact live tool roster and whether
-`AskUserQuestion` was available, so results are self-certifying rather than
-assumed.
+Every run's summary records the exact live tool roster, whether `AskUserQuestion`
+was available, and how many permission prompts reached the callback, so results
+are self-certifying rather than assumed.
 
-With `--interface cli`, the session runs as plain:
-
-```bash
-claude --model claude-opus-4-8 -p --permission-mode bypassPermissions "<prompt>"
-```
-
-`-p` mode has no callback mechanism, so `AskUserQuestion` cannot resolve there —
-this path is kept only for reference/comparison, not as an equivalent alternative.
-Use only on repositories and machines where unrestricted tool execution is
-acceptable.
+The callback approves every tool call it receives, so use this only on repositories
+and machines where unrestricted tool execution is acceptable.
 
 The prompt is identical across conditions except for the selected dataset field:
 
@@ -99,9 +88,7 @@ Resolve the following issue in this repository:
 - The script refuses to reuse a dirty checkout so it never destroys an earlier
   Claude change.
 - `.experiment-logs/` is Git-ignored. It contains an immutable pre-launch manifest
-  and a normalized result for each run. SDK-path summaries also carry the live tool
-  roster (`tool_roster`). CLI-path summaries additionally include transcript copies
-  and `process-output/` stdout/stderr; a missing or malformed matching transcript is
-  logged as `unknown` there, never as a no-question result.
+  and a normalized result for each run, including the live tool roster
+  (`tool_roster`) and the permission mode and prompt count (`permissions`).
 - This is an observational launcher, not an automated evaluation harness.
 - The local dataset schema is documented in [`data/README.md`](data/README.md).

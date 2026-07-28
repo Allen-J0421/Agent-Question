@@ -222,3 +222,66 @@ def test_report_writes_csv_json_and_markdown(tmp_path):
     assert "Direct AskUserQuestion runs: 1 (50.0%)" in paths["markdown"].read_text(
         encoding="utf-8"
     )
+
+
+def _sdk_manifest():
+    return {
+        "run_id": "sdk-run",
+        "started_at": _timestamp(),
+        "task": {"instance_id": "owner__repo-1", "condition": "ambiguous"},
+        "claude": {"model": "claude-opus-4-8", "interface": "sdk"},
+        "workspace": "/tmp/workspace",
+    }
+
+
+def _sdk_observation(first_direct=None, **overrides):
+    observation = {
+        "tool_roster": ["AskUserQuestion", "Read"],
+        "reference_toolset": ["AskUserQuestion", "Read"],
+        "permission_mode": "default",
+        "permission_prompts": 3,
+        "askuserquestion_available": True,
+        "stopped_on_first_ask": first_direct is not None,
+        "result": {"is_error": False, "stop_reason": "end_turn", "num_turns": 5},
+        "analysis": {
+            "first_direct": first_direct,
+            "direct_count": 1 if first_direct else 0,
+            "any_agent_count": 1 if first_direct else 0,
+        },
+    }
+    observation.update(overrides)
+    return observation
+
+
+def test_sdk_summary_reports_callback_measured_first_ask_latency():
+    first = {
+        "tool_use_id": "tu-1",
+        "timestamp": _timestamp(),
+        "latency_seconds": 12.5,
+        "assistant_tool_actions_before": 4,
+        "input": {"questions": [{"question": "Which?", "options": [{"label": "a"}, {"label": "b"}]}]},
+    }
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), _sdk_observation(first))
+
+    ask = summary["ask_user_question"]
+    assert ask["direct_asked"] is True
+    assert ask["first_direct_latency_seconds"] == 12.5
+    assert ask["first_direct"]["question_count"] == 1
+    assert ask["first_direct"]["option_count"] == 2
+
+
+def test_sdk_summary_records_stop_on_first_ask_and_permission_mode():
+    first = {"tool_use_id": "tu-1", "latency_seconds": 1.0, "input": {"questions": []}}
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), _sdk_observation(first))
+
+    assert summary["process"]["stop_reason"] == "stopped_on_first_ask"
+    assert summary["permissions"]["mode"] == "default"
+    assert summary["permissions"]["prompts_reaching_callback"] == 3
+
+
+def test_sdk_summary_without_ask_keeps_model_stop_reason_and_null_latency():
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), _sdk_observation(None))
+
+    assert summary["process"]["stop_reason"] == "end_turn"
+    assert summary["ask_user_question"]["direct_asked"] is False
+    assert summary["ask_user_question"]["first_direct_latency_seconds"] is None

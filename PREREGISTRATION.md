@@ -15,52 +15,49 @@ option count)?
 The original design ran `claude -p --permission-mode bypassPermissions`.
 `-p` mode has no mechanism to resolve a paused `AskUserQuestion` call (no
 callback, no terminal), so the tool cannot function there by construction.
-Separately, live testing found that even the Agent SDK drops
-`AskUserQuestion` from the tool roster unless a `can_use_tool` callback is
-registered — this is a real, reproducible client-construction requirement
-(see `sdk_runner.py`), not a workaround invented for this study. The SDK
-path below is the minimum change that makes the tool functionally
-reachable at all; everything else about the environment is held as close
-to the CLI baseline as the SDK allows.
+The Agent SDK path replaces it: a registered `can_use_tool` callback is
+the SDK's documented substitute for the interactive permission prompt, and
+it makes `AskUserQuestion` both reachable and resolvable. The CLI path has
+been removed rather than retained as a comparison arm, because a path where
+the primary outcome is structurally impossible cannot produce a comparable
+measurement.
 
 ## Tool roster
 
-`config/reference_toolset.json`. Captured live from
+`config/reference_toolset.json`. Captured live on 2026-07-28 from
 `ClaudeAgentOptions(tools={"type": "preset", "preset": "claude_code"},
-strict_mcp_config=True, mcp_servers={})` — the SDK's own "give me the
-standard set" preset, with this machine's personal MCP servers (Gmail,
-Calendar, Drive) excluded so the roster reflects a stock install rather
-than this developer's account-specific extras. No tool was added beyond
-what the preset returns, except `AskUserQuestion` itself, which the preset
-capture omits only because a `can_use_tool` callback wasn't registered for
-that specific capture — it is otherwise a standard, undocumented-as-gated
-tool (confirmed against the official Tools Reference: no plan-tier,
-version, or beta annotation, unlike e.g. `Artifact` or `EndConversation`
-which carry explicit gating notes in the same table). No tool was narrowed
-or removed to make asking more or less likely.
+permission_mode="default", strict_mcp_config=True, mcp_servers={},
+can_use_tool=<callback>)` — the SDK's own "give me the standard set"
+preset, with this machine's personal MCP servers (Gmail, Calendar, Drive)
+excluded so the roster reflects a stock install rather than this
+developer's account-specific extras. Every one of the 28 entries came from
+that live capture. No tool was added by hand, narrowed, or removed.
+`AskUserQuestion` appears in the preset on its own once a callback is
+registered; it does not need to be named explicitly.
 
 ## Permission mode
 
-`bypassPermissions`, unchanged from the original design. This is a **named
-scope limitation**, not an oversight: `bypassPermissions` removes the
-natural interruption points that, in an attended session, sometimes double
-as a moment where a human clarifies intent. The study therefore measures
-*"does Claude ask when it doesn't have to stop for permission anyway"* —
-not *"does Claude ask in a normal permission-prompting session."* Any
-reported ask-rate should be read as a lower-bound-flavored estimate
-relative to a fully attended session, not generalized to "Claude's asking
-behavior" unqualified.
+`default`. Tool calls whose permission rules evaluate to "ask" reach the
+study's `can_use_tool` callback, which records them and approves them, so
+no run is gated on a human being present.
 
-No neutral auto-responder for ordinary permission requests was built, to
-avoid introducing a second new variable alongside the tool-roster fix in
-the same change.
+This replaces the original `bypassPermissions` design, which was not a
+neutral choice. Under `bypassPermissions` the SDK does not invoke
+`can_use_tool` for calls the mode already permits — it emits
+`CanUseToolShadowedWarning` — so ordinary tools never reached the callback
+and the agent never paused. An agent that can read, edit, and run tests
+without interruption can resolve an under-specified issue by inspecting the
+repository, which removes the very occasion on which a human would
+otherwise be asked. Measuring clarification behavior in that environment
+measures the absence of the opportunity, not the absence of the behavior.
+
+`permissions.prompts_reaching_callback` is recorded per run so the presence
+of that friction is verifiable rather than assumed.
 
 ## can_use_tool callback: answering policy
 
-`AskUserQuestion` is a documented, verified exception to
-`bypassPermissions` shadowing — it reaches the callback even in bypass
-mode (confirmed live; ordinary tools like `Write` do not reach the
-callback under bypass, `AskUserQuestion` does). The callback:
+The callback receives ordinary tool calls (recorded, then approved) and
+`AskUserQuestion` calls. For `AskUserQuestion` it:
 
 - **Logs every call in full**: question text, options, per-question
   `multiSelect` flag, timestamp, and the count of main-thread tool actions
@@ -72,10 +69,17 @@ callback under bypass, `AskUserQuestion` does). The callback:
 This answering policy is an explicit modeling assumption, not a neutral
 non-choice — there is no truly neutral way to auto-answer a question
 addressed to a human. It is documented here so it can be evaluated,
-challenged, or varied in a follow-up study. It affects whether Claude asks
-*again* later in the same session; it does not affect the *first* ask,
-which is this study's primary outcome (see below), since the first call
-is fully logged before any synthetic answer is generated.
+challenged, or varied in a follow-up study. It does not affect the *first*
+ask, which is this study's primary outcome (see below), since the first
+call is fully logged before any synthetic answer is generated.
+
+**Stopping rule.** The session ends at the first main-thread
+`AskUserQuestion`. Everything after that point is shaped by the synthetic
+first-option answer rather than by the agent's own reading of the task, so
+it is not evidence about clarification behavior. This matches the stopping
+behavior the CLI path used and makes `direct_count > 1` rare by
+construction — `any_agent_count` remains the measure of subagent asks
+occurring before the stop.
 
 ## Primary and secondary outcomes
 
@@ -99,8 +103,8 @@ uninterpretable 0/23 result under the original CLI-only design.
 
 ## Scope not covered by this study
 
-- Attended/interactive sessions (see permission-mode note above).
-- Post-first-ask behavior under a different answering policy than
-  first-option tie-break.
+- Fully attended sessions, where a human answers permission prompts
+  instead of the callback approving them automatically.
+- Post-first-ask behavior: the run stops at the first main-thread ask.
 - Any account/organization-level variation in tool availability beyond
   this one account, on 2026-07-28.

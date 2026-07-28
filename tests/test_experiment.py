@@ -4,12 +4,12 @@ from experiment import (
     CHECKOUTS,
     CONDITION_FIELD,
     build_prompt,
-    claude_argv,
     requested_conditions,
     select_batch_rows,
     issue_text,
     workspace_path,
 )
+from sdk_runner import PERMISSION_MODE, load_reference_toolset
 
 
 ROW = {
@@ -39,17 +39,17 @@ def test_prompt_contains_only_selected_issue_text():
     assert "AMBIGUOUS TEXT" not in full
 
 
-def test_claude_command_is_headless_and_bypasses_permission_prompts():
-    argv = claude_argv("/usr/bin/claude", "claude-opus-4-8", "PROMPT")
-    assert argv == [
-        "/usr/bin/claude",
-        "--model",
-        "claude-opus-4-8",
-        "-p",
-        "--permission-mode",
-        "bypassPermissions",
-        "PROMPT",
-    ]
+def test_session_does_not_bypass_permission_prompts():
+    # bypassPermissions shadows can_use_tool for ordinary tools, so the agent
+    # never pauses and can always resolve ambiguity by reading the repo
+    # instead of asking. The study depends on that friction being present.
+    assert PERMISSION_MODE == "default"
+
+
+def test_reference_toolset_exposes_askuserquestion():
+    tools = load_reference_toolset()
+    assert "AskUserQuestion" in tools
+    assert "TodoWrite" in tools
 
 
 def test_checkout_is_stored_in_a_gitignored_subdirectory_of_cwd():

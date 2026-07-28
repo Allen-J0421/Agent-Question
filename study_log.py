@@ -460,6 +460,10 @@ def build_run_summary_sdk(
     same, and adds ``tool_roster`` / ``askuserquestion_available`` so every
     run is self-certifying instead of relying on an assumption about
     whether the tool was reachable.
+
+    First-ask latency is measured in-callback by the runner (the SDK has no
+    transcript timestamps to difference against), so it is read straight off
+    ``first_direct`` rather than recomputed here.
     """
     analysis = observation["analysis"]
     first = analysis["first_direct"]
@@ -510,12 +514,20 @@ def build_run_summary_sdk(
         "workspace": manifest["workspace"],
         "process": {
             "exit_code": 1 if result.get("is_error") else 0,
-            "stop_reason": result.get("stop_reason") or result.get("subtype"),
+            "stop_reason": (
+                "stopped_on_first_ask"
+                if observation.get("stopped_on_first_ask")
+                else result.get("stop_reason") or result.get("subtype")
+            ),
             "operator_interrupted": False,
             "duration_seconds": duration,
             "sdk_session_id": result.get("session_id"),
             "sdk_num_turns": result.get("num_turns"),
             "sdk_total_cost_usd": result.get("total_cost_usd"),
+        },
+        "permissions": {
+            "mode": observation.get("permission_mode"),
+            "prompts_reaching_callback": observation.get("permission_prompts"),
         },
         "tool_roster": {
             "tools": observation.get("tool_roster"),
@@ -529,7 +541,9 @@ def build_run_summary_sdk(
             "direct_count": analysis["direct_count"],
             "any_agent_count": analysis["any_agent_count"],
             "first_direct": first_summary,
-            "first_direct_latency_seconds": None,
+            "first_direct_latency_seconds": (
+                first.get("latency_seconds") if first is not None else None
+            ),
         },
     }
 

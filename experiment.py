@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """Launch unattended Claude Code experiments on local dataset issues.
 
-The launcher uses Claude's non-interactive print mode and bypasses its permission
-prompts. Its only task-specific behavioral inputs are the selected issue text and the
-requested model.
+The launcher runs an Agent SDK session in ``default`` permission mode, so tool
+calls that would prompt reach the study's ``can_use_tool`` callback and are
+recorded there before being approved. Its only task-specific behavioral inputs
+are the selected issue text and the requested model.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from datasets import load_from_disk
-from sdk_runner import load_reference_toolset, run_sdk_session
+from sdk_runner import PERMISSION_MODE, load_reference_toolset, run_sdk_session
 from study_log import (
-    build_run_summary,
     build_run_summary_sdk,
     create_run_manifest,
     default_logs_root,
     load_run_summaries,
-    observe_headless_session,
     write_report,
     write_run_summary,
 )
@@ -58,19 +56,6 @@ def issue_text(row: dict[str, Any], condition: str) -> str:
 
 def build_prompt(row: dict[str, Any], condition: str) -> str:
     return f"Resolve the following issue in this repository:\n\n{issue_text(row, condition)}"
-
-
-def claude_argv(claude_bin: str, model: str, prompt: str) -> list[str]:
-    """The non-interactive Claude command used for unattended experiments."""
-    return [
-        claude_bin,
-        "--model",
-        model,
-        "-p",
-        "--permission-mode",
-        "bypassPermissions",
-        prompt,
-    ]
 
 
 def run_git(args: list[str], cwd: Path | None = None, check: bool = True):
@@ -189,119 +174,61 @@ def command_run(args: argparse.Namespace) -> None:
     row = rows[args.instance_id]
     field = CONDITION_FIELD[args.condition]
     prompt = build_prompt(row, args.condition)
-    interface = getattr(args, "interface", "sdk")
-
-    claude_bin = None
-    if interface == "cli":
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SystemExit("claude CLI not found on PATH")
 
     print(f"Instance:  {row['instance_id']}")
     print(f"Repository:{row['repo']}")
     print(f"Condition: {args.condition}")
     print(f"Field:     {field}")
     print(f"Model:     {args.model}")
-    print(f"Interface: {interface}")
     print("\n--- EXACT CLAUDE PROMPT ---")
     print(prompt)
     print("--- END PROMPT ---\n")
 
     if args.dry_run:
         print("Dry run: Claude was not launched.")
-        if interface == "sdk":
-            print(
-                "Command shape: Agent SDK session, permission_mode=bypassPermissions, "
-                "tools=<config/reference_toolset.json>, can_use_tool callback registered "
-                "(required for AskUserQuestion to appear in the roster)."
-            )
-        else:
-            print(
-                "Command shape: claude --model",
-                args.model,
-                "-p --permission-mode bypassPermissions \"<prompt>\"",
-            )
+        print(
+            f"Command shape: Agent SDK session, permission_mode={PERMISSION_MODE}, "
+            "tools=<config/reference_toolset.json>, can_use_tool callback registered "
+            "(observes and approves prompting tool calls; logs AskUserQuestion in full)."
+        )
         return
 
     workspace = prepare_workspace(row, args.condition)
-    print(f"Launching unattended Claude Code ({interface}) in {workspace}", flush=True)
+    print(f"Launching unattended Claude Code (sdk) in {workspace}", flush=True)
     logs_root = Path(args.logs_dir) if args.logs_dir else default_logs_root()
-
-    if interface == "sdk":
-        manifest = create_run_manifest(
-            logs_root,
-            row=row,
-            condition=args.condition,
-            model=args.model,
-            workspace=workspace,
-            prompt=prompt,
-            interface="sdk",
-        )
-        observation = asyncio.run(
-            run_sdk_session(
-                prompt=prompt,
-                workspace=workspace,
-                model=args.model,
-                tools=load_reference_toolset(),
-            )
-        )
-        summary = build_run_summary_sdk(manifest, observation)
-        summary_path = write_run_summary(logs_root, summary)
-        print(f"Run log: {summary_path}", flush=True)
-        roster = summary["tool_roster"]
-        print(
-            f"AskUserQuestion available this run: {roster['askuserquestion_available']}",
-            flush=True,
-        )
-        if roster["matches_reference"] is False:
-            print(
-                f"WARNING: live tool roster did not match reference_toolset.json — "
-                f"missing: {roster['missing_from_actual']}, "
-                f"extra: {roster['extra_in_actual']}",
-                flush=True,
-            )
-        return
 
     manifest = create_run_manifest(
         logs_root,
         row=row,
         condition=args.condition,
         model=args.model,
-        claude_bin=claude_bin,
         workspace=workspace,
         prompt=prompt,
-        interface="cli",
+        interface="sdk",
     )
-    argv = claude_argv(claude_bin, args.model, prompt)
-    try:
-        observation = observe_headless_session(
-            argv,
-            workspace,
-            manifest["started_at"],
-            output_dir=logs_root / "process-output" / manifest["run_id"],
+    observation = asyncio.run(
+        run_sdk_session(
+            prompt=prompt,
+            workspace=workspace,
+            model=args.model,
+            tools=load_reference_toolset(),
         )
-    except OSError as exc:
-        observation = {
-            "exit_code": None,
-            "stop_reason": "launch_error",
-            "operator_interrupted": False,
-            "analysis": {
-                "paths": [],
-                "parse_errors": 0,
-                "valid_records": 0,
-                "first_direct": None,
-                "direct_count": 0,
-                "any_agent_count": 0,
-            },
-        }
-        summary = build_run_summary(manifest, observation, logs_root)
-        summary_path = write_run_summary(logs_root, summary)
-        raise SystemExit(f"could not launch Claude: {exc}\nRun log: {summary_path}") from exc
-    summary = build_run_summary(manifest, observation, logs_root)
+    )
+    summary = build_run_summary_sdk(manifest, observation)
     summary_path = write_run_summary(logs_root, summary)
     print(f"Run log: {summary_path}", flush=True)
-    if observation["operator_interrupted"]:
-        raise KeyboardInterrupt
+    roster = summary["tool_roster"]
+    print(
+        f"AskUserQuestion available this run: {roster['askuserquestion_available']}",
+        flush=True,
+    )
+    if roster["matches_reference"] is False:
+        print(
+            f"WARNING: live tool roster did not match reference_toolset.json — "
+            f"missing: {roster['missing_from_actual']}, "
+            f"extra: {roster['extra_in_actual']}",
+            flush=True,
+        )
 
 
 def command_report(args: argparse.Namespace) -> None:
@@ -352,7 +279,6 @@ def command_batch(args: argparse.Namespace) -> None:
                         model=args.model,
                         dry_run=args.dry_run,
                         logs_dir=args.logs_dir,
-                        interface=args.interface,
                     )
                 )
         except KeyboardInterrupt:
@@ -381,17 +307,6 @@ def parser() -> argparse.ArgumentParser:
         "--logs-dir",
         help="directory for Git-ignored run manifests, transcripts, and summaries",
     )
-    run.add_argument(
-        "--interface",
-        choices=("sdk", "cli"),
-        default="sdk",
-        help=(
-            "sdk (default): Agent SDK session with a can_use_tool callback, "
-            "required for AskUserQuestion to appear in the tool roster at all. "
-            "cli: subprocess `claude -p`, which has no callback mechanism and "
-            "cannot resolve an AskUserQuestion call -- kept only for comparison."
-        ),
-    )
     run.set_defaults(func=command_run)
 
     batch = sub.add_parser(
@@ -415,12 +330,6 @@ def parser() -> argparse.ArgumentParser:
     batch.add_argument(
         "--logs-dir",
         help="directory whose run summaries define resume state",
-    )
-    batch.add_argument(
-        "--interface",
-        choices=("sdk", "cli"),
-        default="sdk",
-        help="see `run --interface` for the difference; applies to every session in the batch",
     )
     batch.set_defaults(func=command_batch)
 
