@@ -59,7 +59,7 @@ async def run_sdk_session(
     workspace: Path,
     model: str,
     tools: list[str] | None = None,
-    stop_on_first_ask: bool = True,
+    stop_on_first_ask: bool = False,
 ) -> dict[str, Any]:
     """Run one headless SDK session and return a structured observation.
 
@@ -69,9 +69,13 @@ async def run_sdk_session(
     ``analysis.any_agent_count``, plus ``tool_roster`` /
     ``askuserquestion_available`` so every run is self-certifying.
 
-    ``stop_on_first_ask`` ends the session once the main thread asks its
-    first question, matching the CLI path's ``stopped_on_first_ask``
-    behavior so the two interfaces measure the same thing.
+    ``stop_on_first_ask`` defaults to ``False`` so the agent runs to
+    completion and leaves a patch that can be graded. Halting at the first
+    ask would make every asking run ungradeable while non-asking runs stayed
+    gradeable, which biases the asked-vs-not-asked comparison in exactly the
+    direction the study is trying to measure. The first ask is still the
+    primary outcome and is recorded in full before any synthetic answer is
+    produced; ``answered_questions`` keeps the rest auditable.
     """
     tools = tools if tools is not None else load_reference_toolset()
 
@@ -86,6 +90,7 @@ async def run_sdk_session(
     direct_count = 0
     any_agent_count = 0
     permission_prompts = 0
+    answered_questions: list[dict[str, Any]] = []
     result_message: dict[str, Any] | None = None
     stopped_on_first_ask = False
 
@@ -117,6 +122,17 @@ async def run_sdk_session(
                         }
             questions = input_data.get("questions") or []
             answers = _first_option_answers(questions)
+            # Every synthetic answer is recorded, not just the first, so the
+            # tie-break's influence on the final patch stays auditable.
+            answered_questions.append(
+                {
+                    "tool_use_id": identifier,
+                    "is_subagent": is_subagent,
+                    "latency_seconds": time.monotonic() - started_monotonic,
+                    "questions": questions,
+                    "answers": answers,
+                }
+            )
             return PermissionResultAllow(
                 updated_input={"questions": questions, "answers": answers}
             )
@@ -179,6 +195,7 @@ async def run_sdk_session(
         "ended_at": ended_at.isoformat(),
         "stopped_on_first_ask": stopped_on_first_ask,
         "permission_prompts": permission_prompts,
+        "answered_questions": answered_questions,
         "analysis": {
             "first_direct": first_direct,
             "direct_count": direct_count,

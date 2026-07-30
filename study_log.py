@@ -447,7 +447,9 @@ def build_run_summary(
 
 
 def build_run_summary_sdk(
-    manifest: dict[str, Any], observation: dict[str, Any]
+    manifest: dict[str, Any],
+    observation: dict[str, Any],
+    evaluation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a run summary from an ``sdk_runner.run_sdk_session`` observation.
 
@@ -489,7 +491,23 @@ def build_run_summary_sdk(
     )
 
     result = observation.get("result") or {}
-    direct_asked = first is not None
+
+    # A session that errored, or that ended without the model doing anything,
+    # is not evidence that the model declined to ask -- it never got the
+    # chance. Recording it as ``False`` would put a non-run in the
+    # denominator of the ask rate, so it is ``None`` ("unknown") instead,
+    # mirroring the CLI path's handling of an unreadable transcript.
+    ran_meaningfully = (
+        not result.get("is_error")
+        and (result.get("num_turns") or 0) > 1
+        and observation.get("permission_prompts", 0) > 0
+    )
+    if first is not None:
+        direct_asked: bool | None = True
+    elif ran_meaningfully:
+        direct_asked = False
+    else:
+        direct_asked = None
 
     actual_tools = observation.get("tool_roster")
     reference_tools = observation.get("reference_toolset")
@@ -529,6 +547,20 @@ def build_run_summary_sdk(
             "mode": observation.get("permission_mode"),
             "prompts_reaching_callback": observation.get("permission_prompts"),
         },
+        "session": {
+            "ran_meaningfully": ran_meaningfully,
+            "monitoring_status": (
+                "observed_ask"
+                if first is not None
+                else "complete_no_ask"
+                if ran_meaningfully
+                else "no_work_performed"
+            ),
+        },
+        # Grades are stored separately (see write_evaluation) so they can be
+        # recomputed without discarding the session record. This mirror is
+        # convenience only; the report always prefers the stored evaluation.
+        "evaluation": evaluation or {"status": "not_evaluated", "resolved": None},
         "tool_roster": {
             "tools": observation.get("tool_roster"),
             "askuserquestion_available": observation.get("askuserquestion_available"),
@@ -544,6 +576,7 @@ def build_run_summary_sdk(
             "first_direct_latency_seconds": (
                 first.get("latency_seconds") if first is not None else None
             ),
+            "answered_questions": observation.get("answered_questions") or [],
         },
     }
 
@@ -552,6 +585,41 @@ def write_run_summary(logs_root: Path, summary: dict[str, Any]) -> Path:
     path = logs_root / "runs" / f"{summary['run_id']}.json"
     write_new_json(path, summary)
     return path
+
+
+def write_evaluation(logs_root: Path, run_id: str, evaluation: dict[str, Any]) -> Path:
+    """Store a run's grade as its own artifact, overwriting any earlier grade.
+
+    Evaluations live in ``evaluations/`` rather than inside the run summary
+    because the two have different lifetimes: a summary records what happened
+    during a session and is immutable, while a grade is a *judgement* about
+    that session which can legitimately be recomputed when the grading rules
+    change. Keeping them apart means re-grading never requires re-running.
+    """
+    path = logs_root / "evaluations" / f"{run_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {**evaluation, "run_id": run_id, "evaluated_at": utc_now()}
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return path
+
+
+def load_evaluations(logs_root: Path) -> dict[str, dict[str, Any]]:
+    """Return stored evaluations keyed by ``run_id``."""
+    evaluations: dict[str, dict[str, Any]] = {}
+    directory = logs_root / "evaluations"
+    if not directory.exists():
+        return evaluations
+    for path in sorted(directory.glob("*.json")):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                value = json.load(handle)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            evaluations[value.get("run_id") or path.stem] = value
+    return evaluations
 
 
 def load_run_summaries(logs_root: Path) -> tuple[list[dict[str, Any]], list[str]]:
@@ -577,6 +645,40 @@ def _numeric_summary(values: list[float | int | None]) -> dict[str, float | None
     if not numeric:
         return {"mean": None, "median": None}
     return {"mean": mean(numeric), "median": median(numeric)}
+
+
+def _resolution_cell(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolution counts over the subset that could actually be scored.
+
+    Runs whose status is not ``scored`` (an unsupported runner, an environment
+    the repository will not import in, a timeout) are deliberately excluded
+    rather than counted as failures, so a harness limitation can never be read
+    as the agent producing a bad patch.
+    """
+    scored = [
+        summary
+        for summary in summaries
+        if summary.get("evaluation", {}).get("status") == "scored"
+    ]
+    resolved = sum(
+        summary["evaluation"].get("resolved") is True for summary in scored
+    )
+    localization = [
+        summary.get("evaluation", {}).get("localization_hit")
+        for summary in summaries
+        if isinstance(summary.get("evaluation", {}).get("localization_hit"), bool)
+    ]
+    return {
+        "runs": len(summaries),
+        "scored": len(scored),
+        "resolved": resolved,
+        "resolve_rate": resolved / len(scored) if scored else None,
+        "localization_checked": len(localization),
+        "localization_hits": sum(localization),
+        "localization_rate": (
+            sum(localization) / len(localization) if localization else None
+        ),
+    }
 
 
 def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> dict[str, Any]:
@@ -606,6 +708,35 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
     ]
     mismatched_rosters = [roster for roster in rosters if not roster["matches_reference"]]
 
+    evaluated = [
+        summary
+        for summary in summaries
+        if summary.get("evaluation", {}).get("status")
+        not in (None, "not_evaluated")
+    ]
+    status_counts: dict[str, int] = {}
+    for summary in evaluated:
+        status = summary["evaluation"]["status"]
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    # The study's headline comparison. Asking is self-selected rather than
+    # randomized, so these cells are reported raw and stratified by difficulty
+    # instead of collapsed into a single number.
+    asked_runs = [
+        summary
+        for summary in evaluated
+        if summary.get("ask_user_question", {}).get("direct_asked") is True
+    ]
+    not_asked_runs = [
+        summary
+        for summary in evaluated
+        if summary.get("ask_user_question", {}).get("direct_asked") is False
+    ]
+    by_difficulty: dict[str, Any] = {}
+    for summary in evaluated:
+        key = summary.get("task", {}).get("difficulty") or "unknown"
+        by_difficulty.setdefault(key, []).append(summary)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
@@ -632,6 +763,19 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
                 }
                 for roster in mismatched_rosters
             ],
+        },
+        "evaluation": {
+            "evaluated": len(evaluated),
+            "status_counts": status_counts,
+            **_resolution_cell(evaluated),
+            "by_asked": {
+                "asked": _resolution_cell(asked_runs),
+                "not_asked": _resolution_cell(not_asked_runs),
+            },
+            "by_difficulty": {
+                key: _resolution_cell(rows)
+                for key, rows in sorted(by_difficulty.items())
+            },
         },
         "secondary": {
             "first_ask_latency_seconds": _numeric_summary(
@@ -665,8 +809,27 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
     }
 
 
+def attach_evaluations(
+    summaries: list[dict[str, Any]], evaluations: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Join each summary with its stored grade, without mutating the summary.
+
+    A grade stored alongside the run always wins over one embedded in an older
+    summary, so re-grading takes effect on the next report.
+    """
+    joined: list[dict[str, Any]] = []
+    for summary in summaries:
+        stored = evaluations.get(summary.get("run_id"))
+        if stored is None:
+            joined.append(summary)
+        else:
+            joined.append({**summary, "evaluation": stored})
+    return joined
+
+
 def write_report(logs_root: Path) -> dict[str, Path]:
     summaries, input_errors = load_run_summaries(logs_root)
+    summaries = attach_evaluations(summaries, load_evaluations(logs_root))
     report = build_report(summaries, input_errors)
     reports_dir = logs_root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -685,12 +848,15 @@ def write_report(logs_root: Path) -> dict[str, Path]:
                 "direct_asked", "direct_count", "any_agent_count", "first_ask_latency_seconds",
                 "tool_actions_before_first_ask", "monitoring_status", "stop_reason", "exit_code",
                 "duration_seconds",
+                "eval_status", "resolved", "f2p_passed", "f2p_total", "p2p_passed",
+                "p2p_total", "localization_hit", "empty_patch",
             ],
         )
         writer.writeheader()
         for summary in summaries:
             ask = summary.get("ask_user_question", {})
             first = ask.get("first_direct") or {}
+            evaluation = summary.get("evaluation", {})
             writer.writerow(
                 {
                     "run_id": summary.get("run_id"),
@@ -704,10 +870,21 @@ def write_report(logs_root: Path) -> dict[str, Path]:
                     "any_agent_count": ask.get("any_agent_count"),
                     "first_ask_latency_seconds": ask.get("first_direct_latency_seconds"),
                     "tool_actions_before_first_ask": first.get("assistant_tool_actions_before"),
-                    "monitoring_status": summary.get("transcript", {}).get("monitoring_status"),
+                    "monitoring_status": (
+                        summary.get("transcript", {}).get("monitoring_status")
+                        or summary.get("session", {}).get("monitoring_status")
+                    ),
                     "stop_reason": summary.get("process", {}).get("stop_reason"),
                     "exit_code": summary.get("process", {}).get("exit_code"),
                     "duration_seconds": summary.get("process", {}).get("duration_seconds"),
+                    "eval_status": evaluation.get("status"),
+                    "resolved": evaluation.get("resolved"),
+                    "f2p_passed": evaluation.get("f2p_passed"),
+                    "f2p_total": evaluation.get("f2p_total"),
+                    "p2p_passed": evaluation.get("p2p_passed"),
+                    "p2p_total": evaluation.get("p2p_total"),
+                    "localization_hit": evaluation.get("localization_hit"),
+                    "empty_patch": evaluation.get("empty_patch"),
                 }
             )
 
@@ -725,13 +902,49 @@ def write_report(logs_root: Path) -> dict[str, Path]:
         )
     else:
         roster_line = ""
+
+    evaluation = report["evaluation"]
+    if evaluation["evaluated"]:
+        def _cell(label: str, cell: dict[str, Any]) -> str:
+            rate = cell["resolve_rate"]
+            text = "n/a" if rate is None else f"{rate:.1%}"
+            return (
+                f"  - {label}: {cell['resolved']}/{cell['scored']} scored ({text})\n"
+            )
+
+        statuses = ", ".join(
+            f"{name} {count}"
+            for name, count in sorted(evaluation["status_counts"].items())
+        )
+        localization_rate = evaluation["localization_rate"]
+        localization_text = (
+            "n/a" if localization_rate is None else f"{localization_rate:.1%}"
+        )
+        overall_rate = evaluation["resolve_rate"]
+        overall_text = "n/a" if overall_rate is None else f"{overall_rate:.1%}"
+        evaluation_line = (
+            "\n## Patch evaluation\n\n"
+            f"- Evaluated runs: {evaluation['evaluated']} ({statuses})\n"
+            f"- Resolved: {evaluation['resolved']}/{evaluation['scored']} scored "
+            f"({overall_text})\n"
+            f"- Localization hits: {evaluation['localization_hits']}/"
+            f"{evaluation['localization_checked']} ({localization_text})\n"
+            "- Resolution by whether the agent asked "
+            "(self-selected, not randomized — see by_difficulty in the JSON):\n"
+            + _cell("asked", evaluation["by_asked"]["asked"])
+            + _cell("did not ask", evaluation["by_asked"]["not_asked"])
+        )
+    else:
+        evaluation_line = ""
+
     markdown_path.write_text(
         "# AskUserQuestion report\n\n"
         f"- Runs logged: {runs['total']}\n"
         f"- Valid primary-outcome runs: {runs['valid_for_primary_outcome']}\n"
         f"- Direct AskUserQuestion runs: {runs['direct_ask_runs']} ({rate_text})\n"
         f"- Unknown runs: {runs['unknown']}\n"
-        f"{roster_line}",
+        f"{roster_line}"
+        f"{evaluation_line}",
         encoding="utf-8",
     )
     return {"json": json_path, "csv": csv_path, "markdown": markdown_path}

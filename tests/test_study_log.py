@@ -285,3 +285,178 @@ def test_sdk_summary_without_ask_keeps_model_stop_reason_and_null_latency():
     assert summary["process"]["stop_reason"] == "end_turn"
     assert summary["ask_user_question"]["direct_asked"] is False
     assert summary["ask_user_question"]["first_direct_latency_seconds"] is None
+
+
+def test_sdk_summary_marks_a_session_that_never_ran_as_unknown():
+    # Observed live: stop_reason=stop_sequence, 1 turn, $0 cost, 0 permission
+    # prompts -- the model never acted. Counting this as "did not ask" would
+    # put a non-run in the denominator of the ask rate.
+    observation = _sdk_observation(
+        None,
+        permission_prompts=0,
+        result={"is_error": False, "stop_reason": "stop_sequence", "num_turns": 1},
+    )
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), observation)
+
+    assert summary["ask_user_question"]["direct_asked"] is None
+    assert summary["session"]["ran_meaningfully"] is False
+    assert summary["session"]["monitoring_status"] == "no_work_performed"
+
+
+def test_sdk_summary_marks_an_errored_session_as_unknown():
+    observation = _sdk_observation(
+        None,
+        permission_prompts=5,
+        result={"is_error": True, "stop_reason": "error", "num_turns": 9},
+    )
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), observation)
+
+    assert summary["ask_user_question"]["direct_asked"] is None
+
+
+def test_sdk_summary_counts_a_real_working_session_as_a_no_ask_observation():
+    observation = _sdk_observation(
+        None,
+        permission_prompts=19,
+        result={"is_error": False, "stop_reason": "end_turn", "num_turns": 30},
+    )
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), observation)
+
+    assert summary["ask_user_question"]["direct_asked"] is False
+    assert summary["session"]["monitoring_status"] == "complete_no_ask"
+
+
+def _eval(status="scored", resolved=True, localization_hit=True):
+    return {
+        "status": status,
+        "resolved": resolved,
+        "f2p_total": 1, "f2p_passed": 1 if resolved else 0,
+        "p2p_total": 1, "p2p_passed": 1 if resolved else 0,
+        "missing_node_ids": [],
+        "localization_hit": localization_hit,
+        "gold_files": ["src/a.py"], "agent_source_files": ["src/a.py"],
+        "agent_test_files": [], "patch_path": None, "patch_bytes": 10,
+        "empty_patch": False, "duration_seconds": 1.0, "error": None,
+    }
+
+
+def _eval_summary(run_id, asked, evaluation, difficulty="15 min - 1 hour"):
+    summary = _summary(run_id, asked)
+    summary["task"]["difficulty"] = difficulty
+    summary["evaluation"] = evaluation
+    return summary
+
+
+def test_sdk_summary_embeds_the_evaluation_block():
+    summary = study_log.build_run_summary_sdk(
+        _sdk_manifest(), _sdk_observation(None), _eval()
+    )
+    assert summary["evaluation"]["status"] == "scored"
+    assert summary["evaluation"]["resolved"] is True
+
+
+def test_sdk_summary_without_an_evaluation_records_not_evaluated():
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), _sdk_observation(None))
+    assert summary["evaluation"] == {"status": "not_evaluated", "resolved": None}
+
+
+def test_report_compares_resolution_between_asking_and_non_asking_runs(tmp_path):
+    logs_root = tmp_path / "logs"
+    study_log.write_run_summary(logs_root, _eval_summary("a", True, _eval(resolved=True)))
+    study_log.write_run_summary(logs_root, _eval_summary("b", False, _eval(resolved=False)))
+    study_log.write_run_summary(logs_root, _eval_summary("c", False, _eval(resolved=True)))
+
+    report = json.loads(study_log.write_report(logs_root)["json"].read_text())
+    block = report["evaluation"]
+
+    assert block["evaluated"] == 3
+    assert block["scored"] == 3
+    assert block["resolved"] == 2
+    assert block["by_asked"]["asked"]["resolved"] == 1
+    assert block["by_asked"]["asked"]["resolve_rate"] == 1.0
+    assert block["by_asked"]["not_asked"]["resolved"] == 1
+    assert block["by_asked"]["not_asked"]["resolve_rate"] == 0.5
+
+
+def test_report_excludes_ungradable_runs_from_the_resolve_rate(tmp_path):
+    # An unsupported runner or a missing dependency must never be counted as
+    # the agent producing a bad patch.
+    logs_root = tmp_path / "logs"
+    study_log.write_run_summary(logs_root, _eval_summary("a", False, _eval(resolved=True)))
+    study_log.write_run_summary(
+        logs_root,
+        _eval_summary("b", False, _eval(status="unsupported_runner", resolved=None)),
+    )
+    study_log.write_run_summary(
+        logs_root,
+        _eval_summary("c", False, _eval(status="env_unavailable", resolved=None)),
+    )
+
+    report = json.loads(study_log.write_report(logs_root)["json"].read_text())
+    block = report["evaluation"]
+
+    assert block["evaluated"] == 3
+    assert block["scored"] == 1
+    assert block["resolve_rate"] == 1.0
+    assert block["status_counts"]["unsupported_runner"] == 1
+    assert block["status_counts"]["env_unavailable"] == 1
+
+
+def test_report_csv_includes_the_evaluation_columns(tmp_path):
+    logs_root = tmp_path / "logs"
+    study_log.write_run_summary(logs_root, _eval_summary("a", False, _eval()))
+
+    text = study_log.write_report(logs_root)["csv"].read_text(encoding="utf-8")
+
+    assert "eval_status" in text and "resolved" in text
+    assert "localization_hit" in text
+    assert "scored" in text
+
+
+def test_report_markdown_reports_the_asked_versus_not_asked_split(tmp_path):
+    logs_root = tmp_path / "logs"
+    study_log.write_run_summary(logs_root, _eval_summary("a", True, _eval(resolved=True)))
+
+    text = study_log.write_report(logs_root)["markdown"].read_text(encoding="utf-8")
+
+    assert "Patch evaluation" in text
+    assert "asked" in text
+
+
+def test_evaluations_are_stored_separately_and_can_be_overwritten(tmp_path):
+    # Grades live outside the write-once run summary precisely so they can be
+    # recomputed when the grading rules change.
+    logs_root = tmp_path / "logs"
+    study_log.write_evaluation(logs_root, "run-1", _eval(resolved=False))
+    study_log.write_evaluation(logs_root, "run-1", _eval(resolved=True))
+
+    stored = study_log.load_evaluations(logs_root)
+    assert stored["run-1"]["resolved"] is True
+    assert "evaluated_at" in stored["run-1"]
+
+
+def test_run_summaries_stay_write_once_while_evaluations_do_not(tmp_path):
+    logs_root = tmp_path / "logs"
+    study_log.write_run_summary(logs_root, _summary("run-1", False))
+
+    try:
+        study_log.write_run_summary(logs_root, _summary("run-1", True))
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("run summaries must remain immutable")
+
+    study_log.write_evaluation(logs_root, "run-1", _eval())
+    study_log.write_evaluation(logs_root, "run-1", _eval(resolved=False))
+
+
+def test_a_stored_evaluation_overrides_one_embedded_in_an_older_summary(tmp_path):
+    logs_root = tmp_path / "logs"
+    summary = _eval_summary("run-1", False, _eval(resolved=False))
+    study_log.write_run_summary(logs_root, summary)
+    study_log.write_evaluation(logs_root, "run-1", _eval(resolved=True))
+
+    report = json.loads(study_log.write_report(logs_root)["json"].read_text())
+
+    assert report["evaluation"]["resolved"] == 1
+    assert report["evaluation"]["resolve_rate"] == 1.0
