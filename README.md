@@ -4,8 +4,9 @@ This repository runs **non-interactive Claude Code with Opus 4.8** on an issue f
 the local dataset.
 
 There is no tool allowlist beyond the standard Claude Code toolset
-(`config/reference_toolset.json`), no custom system prompt, no patch evaluator, and
-no Docker integration.
+(`config/reference_toolset.json`), no custom system prompt, and no Docker
+integration. Each normal run saves its patch and grades it against the dataset's
+SWE-bench oracles.
 
 Sessions run through the **Claude Agent SDK** in `default` permission mode with a
 `can_use_tool` callback registered. Tool calls that would prompt reach the callback,
@@ -27,19 +28,25 @@ the repository instead of asking.
 ## Evaluation
 
 Every run is graded against the dataset's own SWE-bench oracles — no test is
-invented here:
+invented here. Runs **capture** the agent's diff
+(`.experiment-logs/patches/<run_id>.patch`) and grading happens afterwards in the
+**official SWE-bench evaluation harness** (`swebench.harness.run_evaluation`,
+Docker): each instance is graded inside its own prebuilt image with the pinned
+interpreter, dependencies, compiled extensions, and era-correct test runner. That
+makes all 500 instances gradable (django's `runtests.py` and sympy's `bin/test`
+included) and eliminates the `env_unavailable` failures that local grading hits
+(e.g. astropy's logger refusing to initialize under a modern pytest).
 
-1. The agent's diff is saved to `.experiment-logs/patches/<run_id>.patch`.
-2. Every agent-edited **test** file is reverted (source edits are kept), so the
-   agent is never judged by tests it wrote. No gold source patch in the dataset
-   touches a test path, so this cannot discard a real fix.
-3. The gold `test_patch` is applied.
-4. The test files owning the `FAIL_TO_PASS` / `PASS_TO_PASS` node ids are run with
-   `pytest -rA`, and each id is looked up in the output. Whole files are used
-   deliberately: one stale node id on the command line makes pytest report
-   `no tests ran` and discard every other result in the same invocation.
-5. `resolved` is true only when every `FAIL_TO_PASS` **and** every `PASS_TO_PASS`
-   test passes. The workspace is then reset so the next run can reuse it.
+Grading semantics:
+
+1. Every agent-edited **test** file is stripped from the graded patch (source
+   edits are kept), so the agent is never judged by tests it wrote. The full
+   patch stays on disk as evidence.
+2. An empty source patch is unresolved by definition and never costs a container.
+3. `resolved` is true only when every `FAIL_TO_PASS` **and** every `PASS_TO_PASS`
+   test passes, as reported by the harness's per-instance `report.json`.
+4. Localization (`localization_hit`, gold vs agent files) is computed from the
+   stored patch, since the harness does not report it.
 
 ### Grading is separate from running
 
@@ -49,45 +56,44 @@ stored separately in `.experiment-logs/evaluations/<run_id>.json` and can be
 overwritten freely. Changing the grader never costs you a batch of sessions.
 
 ```bash
-# Sessions only; patches saved, grading skipped entirely.
-$PY experiment.py batch --count 20 --scope gradable --no-eval
+# Sessions only (the default): patches saved, grading deferred.
+$PY experiment.py batch --count 20 --condition ambiguous
 
-# Grade (or re-grade) stored patches — no Claude session is re-run.
+# Grade (or re-grade) stored patches — needs Docker running; no Claude session is re-run.
 $PY experiment.py evaluate                 # runs missing an evaluation
 $PY experiment.py evaluate --force         # re-grade everything
 $PY experiment.py evaluate --run-id <uuid> # one run
 $PY experiment.py report                   # aggregates always read the stored grades
 ```
 
-Each run's diff is saved to `.experiment-logs/patches/<run_id>.patch`. Grading
-re-applies that patch to a fresh checkout of `base_commit`, so it never needs the
-original workspace. The agent's own test edits stay in the stored patch as evidence
-but are filtered out before grading, since they are not an oracle.
+Harness artifacts (predictions files, per-instance logs and reports) live under
+`.experiment-logs/swebench/`. Instances that appear in multiple runs (both
+conditions, or a retry) are automatically split across sequential harness
+invocations, since the harness keys predictions by `instance_id`.
 
 `evaluation.status` records why a run could not be scored, and `resolved` is `null`
 for all of them — a harness limitation is never reported as a bad patch:
 
 | status | meaning |
 |---|---|
-| `scored` | Graded normally. |
-| `unsupported_runner` | django/sympy ids are not pytest node ids (306 of 500). |
-| `env_unavailable` | The repository does not import in this virtualenv. |
-| `test_patch_failed` | The gold `test_patch` would not apply. |
-| `timeout` | The graded pytest run exceeded `--eval-timeout`. |
+| `scored` | Graded normally (harness report, or empty patch ⇒ unresolved). |
+| `error` | The harness produced no report for this instance (e.g. image build failure). |
+| `timeout` | The graded test run exceeded `--eval-timeout`. |
+| `not_evaluated` | Patch captured; `evaluate` has not graded it yet. |
 
-## Scope
+## Preflight: certifying the ask channel
 
-Only **194 of 500** instances use pytest node ids; django (231) and sympy (75) use
-their own runners. `--scope gradable` restricts the candidate pool *before*
-selection, so `--count 50` gives 50 gradable instances rather than 50 of the first
-500 with most skipped.
+The study's primary outcome is whether the agent calls `AskUserQuestion`. A batch
+of zero-ask runs is only meaningful if asking was actually *possible*, so `batch`
+first runs a **preflight canary**: one short SDK session, with the experiment's
+exact toolset and permission mode, whose prompt forces a single AskUserQuestion
+round-trip. The batch aborts unless the question was asked **and** synthetically
+answered. Skip with `--skip-preflight`; run standalone with:
 
 ```bash
-$PY experiment.py batch --count 50 --condition ambiguous --scope gradable
-$PY experiment.py list --scope gradable --limit 20
+$PY experiment.py preflight
 ```
 
-Ask-behavior can still be measured on all 500 with the default `--scope all`.
 
 ## Dataset fields
 
@@ -108,16 +114,22 @@ $PY experiment.py list --limit 20
 # Preview the exact selected field and Claude command without launching anything.
 $PY experiment.py run astropy__astropy-13579 --condition ambiguous --dry-run
 
-# Run one unattended Claude experiment.
+# Certify the AskUserQuestion channel (also runs automatically before each batch).
+$PY experiment.py preflight
+
+# Run one unattended Claude Agent SDK experiment (patch captured; grading deferred).
 $PY experiment.py run astropy__astropy-13579 --condition ambiguous
 
-# Run the next 50 incomplete dataset instances, one unattended session at a time.
+# Run the next 50 incomplete instances, one unattended session at a time.
 $PY experiment.py batch --count 50 --condition ambiguous
 
 # Run both conditions for the next 50 incomplete dataset instances (up to 100 sessions).
 $PY experiment.py batch --count 50 --condition both
 
-# Aggregate the run logs after one or more sessions.
+# Grade every ungraded run in the official SWE-bench harness (Docker must be running).
+$PY experiment.py evaluate
+
+# Aggregate ask behavior, tool-roster, and stored evaluation results.
 $PY experiment.py report
 
 # Equivalent standalone report builder.
@@ -126,7 +138,9 @@ $PY study_log.py
 
 The launcher prepares a normal GitHub checkout under the Git-ignored
 `.experiment-checkouts/` subdirectory of the directory where you invoke it, checks
-out the instance's `base_commit`, and then launches a session against it.
+out the instance's `base_commit`, and then launches a session against it. It
+saves the agent patch, resets the checkout for reuse, and defers grading to
+the `evaluate` command (official SWE-bench harness).
 
 Each session is an Agent SDK session: `permission_mode` `default`, `tools` set to
 `config/reference_toolset.json`, and a `can_use_tool` callback that records and
@@ -149,11 +163,23 @@ Resolve the following issue in this repository:
 <selected issue text>
 ```
 
+## Command reference
+
+| Command | Purpose | Important options |
+|---|---|---|
+| `list` | Show candidate dataset instances. | `--repo`, `--limit` |
+| `preflight` | Certify the AskUserQuestion channel with one forced round-trip. | `--model` |
+| `run <instance_id>` | Run one condition for one instance. | `--condition`, `--dry-run` |
+| `batch --count N` | Run the next incomplete instances sequentially. | `--condition ambiguous\|full\|both`, `--skip-preflight` |
+| `evaluate` | Grade saved patches without re-running Claude. | `--run-id`, `--force`, `--max-workers`, `--eval-timeout` |
+| `report` | Rebuild CSV, JSON, and Markdown aggregates from stored runs and grades. | `--logs-dir` |
+
+
 ## Notes
 
 - Run one task at a time.
-- The dataset currently contains 500 instances. `batch --count N` accepts 1 through
-  500 and runs sessions sequentially. Resume state comes from `.experiment-logs/`:
+- The dataset currently contains 500 instances. `batch --count N` accepts 1 through 500 and runs sessions
+  sequentially. Resume state comes from `.experiment-logs/`:
   rerunning the same batch command skips logged `(instance, condition, model)` runs
   and continues with the next incomplete instances. With `--condition both`, `N`
   means N instances, so each can produce two sessions.
@@ -162,5 +188,11 @@ Resolve the following issue in this repository:
 - `.experiment-logs/` is Git-ignored. It contains an immutable pre-launch manifest
   and a normalized result for each run, including the live tool roster
   (`tool_roster`) and the permission mode and prompt count (`permissions`).
-- This is an observational launcher, not an automated evaluation harness.
+- A run that errors out or never does meaningful work (e.g. a usage-limit
+  rejection: one turn, $0) is recorded but treated as **retryable** — rerunning
+  the batch picks the instance up again instead of burying it. The SDK error
+  subtype and message are persisted in the run summary (`process.sdk_error`).
+- The default `evaluate` harness needs Docker running and pulls per-instance
+  images from the `swebench` Docker Hub namespace (arm64 images exist for most
+  instances; pass `--swebench-namespace ''` to build locally instead).
 - The local dataset schema is documented in [`data/README.md`](data/README.md).

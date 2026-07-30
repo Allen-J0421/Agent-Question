@@ -4,10 +4,8 @@ from experiment import (
     CHECKOUTS,
     CONDITION_FIELD,
     build_prompt,
-    is_gradable,
     load_rows,
     requested_conditions,
-    scoped_rows,
     select_batch_rows,
     issue_text,
     workspace_path,
@@ -105,45 +103,8 @@ def test_batch_both_runs_only_the_missing_condition_for_resumed_instances():
     ]
 
 
-GRADABLE_ROW = {
-    **ROW,
-    "instance_id": "astropy__astropy-1",
-    "FAIL_TO_PASS": '["astropy/x/tests/test_a.py::test_b"]',
-    "PASS_TO_PASS": "[]",
-}
-UNGRADABLE_ROW = {
-    **ROW,
-    "instance_id": "django__django-1",
-    "FAIL_TO_PASS": '["test_x (auth_tests.test_validators.Tests)"]',
-    "PASS_TO_PASS": "[]",
-}
-
-
-def test_gradable_scope_recognizes_pytest_node_ids_only():
-    assert is_gradable(GRADABLE_ROW)
-    assert not is_gradable(UNGRADABLE_ROW)
-
-
-def test_scope_filters_the_candidate_pool_before_selection():
-    # --count N must mean "N instances I can grade", not "N of the first 500
-    # most of which get skipped".
-    rows = [UNGRADABLE_ROW, UNGRADABLE_ROW, GRADABLE_ROW]
-
-    assert len(scoped_rows(rows, "all")) == 3
-    assert scoped_rows(rows, "gradable") == [GRADABLE_ROW]
-
-    selected = select_batch_rows(
-        scoped_rows(rows, "gradable"), set(), ("ambiguous",), "model", 1
-    )
-    assert [row["instance_id"] for row, _ in selected] == ["astropy__astropy-1"]
-
-
-def test_the_real_dataset_has_the_expected_gradable_subset():
-    rows = list(load_rows().values())
-    gradable = scoped_rows(rows, "gradable")
-    assert len(rows) == 500
-    assert len(gradable) == 194
-    assert not any(row["repo"] in ("django/django", "sympy/sympy") for row in gradable)
+def test_the_real_dataset_has_500_instances():
+    assert len(load_rows()) == 500
 
 
 def test_sessions_run_to_completion_so_asking_runs_are_still_gradable():
@@ -157,3 +118,34 @@ def test_sessions_run_to_completion_so_asking_runs_are_still_gradable():
         "stop_on_first_ask"
     ].default
     assert default is False
+
+
+def test_dead_runs_do_not_block_a_retry(tmp_path):
+    # A run that errored or never did meaningful work observed nothing about
+    # the ask decision, so the batch must pick its instance up again. The
+    # 2026-07-30 batch buried six usage-limit rejections without this.
+    import json
+
+    from experiment import completed_run_keys
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+
+    def write(run_id, instance_id, ran_meaningfully, stop_reason="end_turn"):
+        (runs / f"{run_id}.json").write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "task": {"instance_id": instance_id, "condition": "ambiguous"},
+                    "claude": {"model": "model"},
+                    "process": {"stop_reason": stop_reason},
+                    "session": {"ran_meaningfully": ran_meaningfully},
+                }
+            )
+        )
+
+    write("good", "one", True)
+    write("dead", "two", False)          # e.g. usage-limit rejection
+    write("launch", "three", True, stop_reason="launch_error")
+
+    assert completed_run_keys(tmp_path) == {("one", "ambiguous", "model")}

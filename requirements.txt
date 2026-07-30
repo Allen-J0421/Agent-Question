@@ -1,2 +1,4 @@
 datasets
 claude-agent-sdk
+swebench
+cbor2<6  # 6.x ships no macOS wheels and needs a Rust toolchain to build

@@ -460,3 +460,33 @@ def test_a_stored_evaluation_overrides_one_embedded_in_an_older_summary(tmp_path
 
     assert report["evaluation"]["resolved"] == 1
     assert report["evaluation"]["resolve_rate"] == 1.0
+
+
+def test_sdk_summary_persists_error_evidence():
+    # Without these fields an errored run (e.g. a usage-limit rejection: one
+    # turn, $0) is indistinguishable from "the agent chose to do nothing",
+    # and the actual error text dies with the observation.
+    observation = _sdk_observation(
+        result={
+            "is_error": True,
+            "subtype": "error_during_execution",
+            "stop_reason": None,
+            "num_turns": 1,
+            "total_cost_usd": 0,
+            "result": "usage limit reached — resets at 22:00",
+        }
+    )
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), observation)
+
+    process = summary["process"]
+    assert process["sdk_is_error"] is True
+    assert process["sdk_result_subtype"] == "error_during_execution"
+    assert "usage limit" in process["sdk_error"]
+    assert summary["session"]["ran_meaningfully"] is False
+
+
+def test_sdk_summary_records_no_error_fields_on_success():
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), _sdk_observation(None))
+    process = summary["process"]
+    assert process["sdk_is_error"] is False
+    assert process["sdk_error"] is None

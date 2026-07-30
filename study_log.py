@@ -542,6 +542,18 @@ def build_run_summary_sdk(
             "sdk_session_id": result.get("session_id"),
             "sdk_num_turns": result.get("num_turns"),
             "sdk_total_cost_usd": result.get("total_cost_usd"),
+            # Failure evidence. Without these fields an errored run is
+            # indistinguishable from "the agent chose to do nothing", and the
+            # actual error text (e.g. a usage-limit rejection) is lost with
+            # the observation. See the 2026-07-30 batch: six $0 one-turn runs
+            # whose cause had to be reconstructed from timing alone.
+            "sdk_is_error": bool(result.get("is_error")),
+            "sdk_result_subtype": result.get("subtype"),
+            "sdk_error": (
+                str(result.get("result"))[:2000]
+                if result.get("is_error") and result.get("result")
+                else None
+            ),
         },
         "permissions": {
             "mode": observation.get("permission_mode"),

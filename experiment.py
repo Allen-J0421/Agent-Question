@@ -11,20 +11,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import subprocess
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from datasets import load_from_disk
-from evaluation import (
-    DEFAULT_TIMEOUT_SECONDS,
-    capture_agent_patch,
-    evaluate_patch,
-    evaluate_run,
-    parse_node_ids,
-    uses_pytest_ids,
-)
+
+import swebench_eval
 from sdk_runner import PERMISSION_MODE, load_reference_toolset, run_sdk_session
+from swebench_eval import capture_agent_patch
 from study_log import (
     build_run_summary_sdk,
     create_run_manifest,
@@ -48,44 +44,11 @@ CONDITION_FIELD = {
 }
 BATCH_CONDITIONS = (*CONDITION_FIELD, "both")
 
-SCOPES = ("all", "gradable")
-DEFAULT_SCOPE = "all"
-SCOPE_HELP = (
-    "all (default): every dataset instance. gradable: only instances whose "
-    "FAIL_TO_PASS/PASS_TO_PASS use pytest node ids and can therefore be scored "
-    "(194 of 500; excludes django and sympy, which use their own runners). "
-    "Scope is applied before selection, so --count N yields N in-scope instances."
-)
-
 
 @lru_cache(maxsize=1)
 def load_rows() -> dict[str, dict[str, Any]]:
     split = load_from_disk(str(DATASET))["test"]
     return {split[i]["instance_id"]: dict(split[i]) for i in range(len(split))}
-
-
-def is_gradable(row: dict[str, Any]) -> bool:
-    """Return whether this instance's pass/fail oracle is pytest-addressable.
-
-    django and sympy record their test ids in their own runners' formats, which
-    ``evaluation`` cannot execute; 194 of the 500 instances use pytest node ids.
-    """
-    node_ids = parse_node_ids(row.get("FAIL_TO_PASS", "")) + parse_node_ids(
-        row.get("PASS_TO_PASS", "")
-    )
-    return uses_pytest_ids(node_ids)
-
-
-def scoped_rows(rows: list[dict[str, Any]], scope: str) -> list[dict[str, Any]]:
-    """Restrict the candidate pool before selection.
-
-    Filtering here rather than after selection is what makes ``--count N`` mean
-    "N instances I can actually grade" instead of "N of the first 500, most of
-    which are skipped".
-    """
-    if scope == "gradable":
-        return [row for row in rows if is_gradable(row)]
-    return rows
 
 
 def issue_text(row: dict[str, Any], condition: str) -> str:
@@ -157,10 +120,10 @@ def prepare_workspace(row: dict[str, Any], condition: str) -> Path:
 
 
 def command_list(args: argparse.Namespace) -> None:
-    rows = scoped_rows(list(load_rows().values()), getattr(args, "scope", DEFAULT_SCOPE))
+    rows = list(load_rows().values())
     if args.repo:
         rows = [row for row in rows if row["repo"] == args.repo]
-    print(f"# {len(rows)} instance(s) in scope", flush=True)
+    print(f"# {len(rows)} instance(s)", flush=True)
     for row in rows[: args.limit]:
         print(f"{row['instance_id']}\t{row['repo']}\t{row['difficulty']}")
 
@@ -185,6 +148,13 @@ def completed_run_keys(logs_root: Path) -> set[tuple[str, str, str]]:
         model = claude.get("model")
         # A failed process launch never executed an experiment and is retryable.
         if process.get("stop_reason") == "launch_error":
+            continue
+        # A session that errored out or never did meaningful work observed
+        # nothing about the ask decision (`direct_asked` is None), so it must
+        # not block a re-run. Usage-limit rejections land here: they exit in
+        # one turn at $0 cost, and treating them as "completed" would bury the
+        # instance forever.
+        if summary.get("session", {}).get("ran_meaningfully") is False:
             continue
         if (
             isinstance(instance_id, str)
@@ -215,6 +185,76 @@ def select_batch_rows(
         if len(selected) == count:
             break
     return selected
+
+
+# The canary must force one real AskUserQuestion round-trip through the same
+# SDK configuration the experiment uses. Ten runs of the 2026-07-30 batch all
+# recorded zero asks; without this check there is no way to tell "the agent
+# chose not to ask" (the study's outcome) from "asking was structurally
+# impossible" (a broken measurement channel).
+PREFLIGHT_PROMPT = (
+    "This is an instrumentation check of the question-asking channel, not a "
+    "real task. Call the AskUserQuestion tool exactly once: ask a single "
+    "question with exactly two options about which word this check should "
+    "print. After you receive an answer, reply with the single word DONE. "
+    "Do not use any other tools and do not create any files."
+)
+
+
+def run_preflight(model: str) -> None:
+    """Verify a forced AskUserQuestion call is asked *and answered* end-to-end.
+
+    Runs one short SDK session with the experiment's exact toolset and
+    permission mode in a throwaway directory, and fails loudly if the ask
+    channel does not round-trip. A passing preflight certifies that a zero-ask
+    result in the following batch is agent behavior, not harness breakage.
+    """
+    print(f"Preflight: forcing one AskUserQuestion round-trip on {model}...", flush=True)
+    with tempfile.TemporaryDirectory(prefix="ambig-swe-preflight-") as tmp:
+        observation = asyncio.run(
+            run_sdk_session(
+                prompt=PREFLIGHT_PROMPT,
+                workspace=Path(tmp),
+                model=model,
+                tools=load_reference_toolset(),
+            )
+        )
+
+    result = observation.get("result") or {}
+    analysis = observation["analysis"]
+    answered = observation.get("answered_questions") or []
+
+    problems: list[str] = []
+    if not observation.get("askuserquestion_available"):
+        problems.append("AskUserQuestion is missing from the live tool roster")
+    if result.get("is_error"):
+        problems.append(
+            "session errored (subtype="
+            f"{result.get('subtype')}): {str(result.get('result'))[:300]}"
+        )
+    if analysis["direct_count"] < 1:
+        problems.append("the model never called AskUserQuestion")
+    if not answered:
+        problems.append("no synthetic answer was recorded; the ask channel did not round-trip")
+
+    if problems:
+        raise SystemExit(
+            "Preflight FAILED — ask-rate measurements from this configuration "
+            "cannot be trusted:\n  - " + "\n  - ".join(problems)
+        )
+
+    first = analysis["first_direct"] or {}
+    latency = first.get("latency_seconds")
+    cost = result.get("total_cost_usd") or 0
+    print(
+        "Preflight PASSED: AskUserQuestion was asked and answered "
+        f"(latency {latency:.1f}s, {len(answered)} answer(s), cost ${cost:.4f}).",
+        flush=True,
+    )
+
+
+def command_preflight(args: argparse.Namespace) -> None:
+    run_preflight(args.model)
 
 
 def command_run(args: argparse.Namespace) -> None:
@@ -266,45 +306,25 @@ def command_run(args: argparse.Namespace) -> None:
         )
     )
 
-    if getattr(args, "no_eval", False):
-        # Capture only: the patch is saved and the workspace reset, so the run
-        # can be graded later with `experiment.py evaluate`.
-        captured = capture_agent_patch(
-            workspace=workspace,
-            run_git=run_git,
-            logs_root=logs_root,
-            run_id=manifest["run_id"],
-        )
-        print(
-            f"Saved agent patch ({captured['patch_bytes']} bytes); "
-            "grading skipped (--no-eval).",
-            flush=True,
-        )
-        evaluation = {"status": "not_evaluated", "resolved": None}
-    else:
-        print("Grading agent patch against the dataset oracles...", flush=True)
-        evaluation = evaluate_run(
-            row=row,
-            workspace=workspace,
-            run_git=run_git,
-            logs_root=logs_root,
-            run_id=manifest["run_id"],
-            timeout=args.eval_timeout,
-        )
+    # Capture only: the patch is saved and the workspace reset. Grading
+    # happens later in the official SWE-bench harness (`evaluate`), which
+    # provisions the per-instance environment this machine cannot.
+    captured = capture_agent_patch(
+        workspace=workspace,
+        run_git=run_git,
+        logs_root=logs_root,
+        run_id=manifest["run_id"],
+    )
+    print(
+        f"Saved agent patch ({captured['patch_bytes']} bytes); grade later "
+        "with `experiment.py evaluate` (official SWE-bench harness).",
+        flush=True,
+    )
+    evaluation = {"status": swebench_eval.STATUS_NOT_EVALUATED, "resolved": None}
     summary = build_run_summary_sdk(manifest, observation, evaluation)
     summary_path = write_run_summary(logs_root, summary)
     write_evaluation(logs_root, manifest["run_id"], evaluation)
     print(f"Run log: {summary_path}", flush=True)
-    if evaluation.get("status") != "not_evaluated":
-        print(
-            f"Evaluation: status={evaluation['status']} resolved={evaluation['resolved']} "
-            f"F2P={evaluation['f2p_passed']}/{evaluation['f2p_total']} "
-            f"P2P={evaluation['p2p_passed']}/{evaluation['p2p_total']} "
-            f"localization_hit={evaluation['localization_hit']}",
-            flush=True,
-        )
-        if evaluation["error"]:
-            print(f"Evaluation note: {evaluation['error']}", flush=True)
     roster = summary["tool_roster"]
     print(
         f"AskUserQuestion available this run: {roster['askuserquestion_available']}",
@@ -320,11 +340,12 @@ def command_run(args: argparse.Namespace) -> None:
 
 
 def command_evaluate(args: argparse.Namespace) -> None:
-    """Re-grade stored agent patches without re-running any Claude session.
+    """Grade stored agent patches without re-running any Claude session.
 
     Grading is a judgement about a run, not part of it, so changing the rules
-    should never cost a batch of sessions. This reads each run's saved patch,
-    grades it in a fresh checkout, and overwrites only the evaluation record.
+    should never cost a batch of sessions. All grading happens in the official
+    SWE-bench harness: Docker, per-instance environments, every repository's
+    own runner — all 500 instances are gradable.
     """
     logs_root = Path(args.logs_dir) if args.logs_dir else default_logs_root()
     summaries, errors = load_run_summaries(logs_root)
@@ -335,11 +356,34 @@ def command_evaluate(args: argparse.Namespace) -> None:
 
     rows = load_rows()
     stored = load_evaluations(logs_root)
+
+    def is_graded(run_id: str | None) -> bool:
+        # Runs write a `not_evaluated` placeholder at capture time; only a
+        # real grade counts as "already evaluated".
+        record = stored.get(run_id)
+        return (
+            record is not None
+            and record.get("status") != swebench_eval.STATUS_NOT_EVALUATED
+        )
+
     selected = [
         summary
         for summary in summaries
         if (not args.run_id or summary.get("run_id") == args.run_id)
-        and (args.force or summary.get("run_id") not in stored)
+        and (args.force or not is_graded(summary.get("run_id")))
+    ]
+    for summary in selected:
+        instance_id = summary.get("task", {}).get("instance_id")
+        if instance_id not in rows:
+            print(
+                f"WARNING: {summary.get('run_id')}: unknown instance "
+                f"{instance_id}; skipped",
+                flush=True,
+            )
+    selected = [
+        summary
+        for summary in selected
+        if summary.get("task", {}).get("instance_id") in rows
     ]
     if not selected:
         raise SystemExit(
@@ -347,38 +391,36 @@ def command_evaluate(args: argparse.Namespace) -> None:
             "have a stored evaluation."
         )
 
-    print(f"Evaluating {len(selected)} run(s) from stored patches", flush=True)
-    for index, summary in enumerate(selected, start=1):
-        run_id = summary["run_id"]
-        task = summary.get("task", {})
-        instance_id = task.get("instance_id")
-        condition = task.get("condition")
-        row = rows.get(instance_id)
-        if row is None:
-            print(f"  [{index}] {run_id}: unknown instance {instance_id}", flush=True)
-            continue
-
-        patch_file = logs_root / "patches" / f"{run_id}.patch"
-        patch = patch_file.read_text(encoding="utf-8") if patch_file.exists() else ""
-
-        workspace = prepare_workspace(row, condition)
-        evaluation = evaluate_patch(
-            row=row,
-            workspace=workspace,
-            run_git=run_git,
-            patch=patch,
-            patch_path=str(patch_file) if patch_file.exists() else None,
-            timeout=args.eval_timeout,
+    ready, reason = swebench_eval.docker_ready()
+    if not ready:
+        raise SystemExit(
+            "The official SWE-bench harness needs a running Docker daemon: "
+            f"{reason}\nStart Docker Desktop and re-run."
         )
+    print(
+        f"Evaluating {len(selected)} run(s) with the official SWE-bench "
+        f"harness (dataset {swebench_eval.DATASET_NAME})",
+        flush=True,
+    )
+    evaluations = swebench_eval.evaluate_with_harness(
+        logs_root=logs_root,
+        rows=rows,
+        summaries=selected,
+        max_workers=args.max_workers,
+        timeout=args.eval_timeout,
+        namespace=args.swebench_namespace or None,
+    )
+    by_run = {summary["run_id"]: summary for summary in selected}
+    for run_id, evaluation in evaluations.items():
         write_evaluation(logs_root, run_id, evaluation)
+        task = by_run[run_id].get("task", {})
         print(
-            f"  [{index}/{len(selected)}] {instance_id} ({condition}): "
+            f"  {task.get('instance_id')} ({task.get('condition')}): "
             f"status={evaluation['status']} resolved={evaluation['resolved']} "
             f"F2P={evaluation['f2p_passed']}/{evaluation['f2p_total']} "
             f"P2P={evaluation['p2p_passed']}/{evaluation['p2p_total']}",
             flush=True,
         )
-
     print("\nRun `experiment.py report` to regenerate the aggregates.", flush=True)
 
 
@@ -391,15 +433,9 @@ def command_report(args: argparse.Namespace) -> None:
 
 
 def command_batch(args: argparse.Namespace) -> None:
-    # Scope narrows the candidate pool before selection, so --count N always
-    # means N instances within the scope rather than N of the whole dataset.
-    rows = scoped_rows(list(load_rows().values()), args.scope)
-    if not rows:
-        raise SystemExit(f"no dataset instances match --scope {args.scope}")
+    rows = list(load_rows().values())
     if args.count <= 0 or args.count > len(rows):
-        raise SystemExit(
-            f"--count must be between 1 and {len(rows)} for --scope {args.scope}"
-        )
+        raise SystemExit(f"--count must be between 1 and {len(rows)}")
 
     logs_root = Path(args.logs_dir) if args.logs_dir else default_logs_root()
     conditions = requested_conditions(args.condition)
@@ -418,10 +454,13 @@ def command_batch(args: argparse.Namespace) -> None:
     session_count = sum(len(missing) for _, missing in selected)
     print(
         f"Batch: {len(selected)} dataset instances, {session_count} Claude session(s), "
-        f"condition={args.condition}, model={args.model}, scope={args.scope} "
-        f"({len(rows)} instances in scope)",
+        f"condition={args.condition}, model={args.model} "
+        f"({len(rows)} instances in the dataset)",
         flush=True,
     )
+    # Certify the ask channel before spending a batch of sessions on it.
+    if not args.dry_run and not args.skip_preflight:
+        run_preflight(args.model)
     for index, (row, missing) in enumerate(selected, start=1):
         try:
             for condition in missing:
@@ -437,8 +476,6 @@ def command_batch(args: argparse.Namespace) -> None:
                         model=args.model,
                         dry_run=args.dry_run,
                         logs_dir=args.logs_dir,
-                        eval_timeout=args.eval_timeout,
-                        no_eval=args.no_eval,
                     )
                 )
         except KeyboardInterrupt:
@@ -452,12 +489,6 @@ def parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("list", help="list available dataset instances")
     ls.add_argument("--limit", type=int, default=20)
     ls.add_argument("--repo", help="optional exact owner/name repository filter")
-    ls.add_argument(
-        "--scope",
-        choices=SCOPES,
-        default=DEFAULT_SCOPE,
-        help=SCOPE_HELP,
-    )
     ls.set_defaults(func=command_list)
 
     run = sub.add_parser("run", help="launch one unattended Claude session")
@@ -472,17 +503,6 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--logs-dir",
         help="directory for Git-ignored run manifests, transcripts, and summaries",
-    )
-    run.add_argument(
-        "--eval-timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT_SECONDS,
-        help="seconds allowed for the graded pytest run before it is recorded as a timeout",
-    )
-    run.add_argument(
-        "--no-eval",
-        action="store_true",
-        help="save the agent patch but skip grading; grade later with `evaluate`",
     )
     run.set_defaults(func=command_run)
 
@@ -509,27 +529,18 @@ def parser() -> argparse.ArgumentParser:
         help="directory whose run summaries define resume state",
     )
     batch.add_argument(
-        "--scope",
-        choices=SCOPES,
-        default=DEFAULT_SCOPE,
-        help=SCOPE_HELP,
-    )
-    batch.add_argument(
-        "--eval-timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT_SECONDS,
-        help="seconds allowed for each graded pytest run before it is recorded as a timeout",
-    )
-    batch.add_argument(
-        "--no-eval",
+        "--skip-preflight",
         action="store_true",
-        help="save agent patches but skip grading; grade later with `evaluate`",
+        help=(
+            "skip the AskUserQuestion preflight canary that certifies the ask "
+            "channel before the batch spends any sessions"
+        ),
     )
     batch.set_defaults(func=command_batch)
 
     evaluate = sub.add_parser(
         "evaluate",
-        help="re-grade stored agent patches without re-running any session",
+        help="grade stored agent patches without re-running any session",
     )
     evaluate.add_argument(
         "--logs-dir",
@@ -545,12 +556,33 @@ def parser() -> argparse.ArgumentParser:
         help="re-grade runs that already have a stored evaluation",
     )
     evaluate.add_argument(
+        "--max-workers",
+        type=int,
+        default=swebench_eval.DEFAULT_MAX_WORKERS,
+        help="parallel containers for the swebench harness",
+    )
+    evaluate.add_argument(
+        "--swebench-namespace",
+        default=swebench_eval.DEFAULT_NAMESPACE,
+        help=(
+            "Docker Hub namespace for prebuilt per-instance images; pass '' "
+            "to build images locally instead of pulling"
+        ),
+    )
+    evaluate.add_argument(
         "--eval-timeout",
         type=int,
-        default=DEFAULT_TIMEOUT_SECONDS,
-        help="seconds allowed for each graded pytest run",
+        default=swebench_eval.DEFAULT_TIMEOUT,
+        help="seconds allowed per graded instance",
     )
     evaluate.set_defaults(func=command_evaluate)
+
+    preflight = sub.add_parser(
+        "preflight",
+        help="certify the AskUserQuestion channel with one forced round-trip",
+    )
+    preflight.add_argument("--model", default=DEFAULT_MODEL)
+    preflight.set_defaults(func=command_preflight)
 
     report = sub.add_parser("report", help="aggregate AskUserQuestion run logs")
     report.add_argument("--logs-dir", help="log directory created by the run command")
