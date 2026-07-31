@@ -156,6 +156,94 @@ def find_workspace_transcripts(
     return sorted(candidates)
 
 
+def agent_messages_text(records: list[tuple[int, dict[str, Any]]]) -> str:
+    """Render only the agent's own words from one session file.
+
+    Assistant records carry a content list; the text blocks are what the
+    agent said. Tool calls, tool results, and harness bookkeeping are all
+    omitted -- the raw ``.jsonl`` copy under ``sessions/`` keeps those.
+    """
+    parts: list[str] = []
+    index = 0
+    for _, record in records:
+        if record.get("type") != "assistant":
+            continue
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        texts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        texts = [text for text in texts if text and text.strip()]
+        if not texts:
+            continue
+        index += 1
+        parts.append(f"[assistant #{index} @ {record.get('timestamp') or '?'}]")
+        parts.extend(texts)
+        parts.append("")
+    return "\n".join(parts).rstrip() + ("\n" if parts else "")
+
+
+def preserve_session_artifacts(
+    logs_root: Path,
+    *,
+    run_id: str,
+    workspace: Path,
+    started_at: str,
+    session_id: str | None,
+    projects_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Copy this run's raw session files and distill agent-only transcripts.
+
+    Claude Code's own session records live under ``~/.claude/projects`` and
+    are pruned on a retention schedule, so a run summary's
+    ``sdk_session_id`` would eventually dangle. Copying at capture time
+    makes the raw trace a first-class, run_id-keyed study artifact:
+
+    - ``sessions/<run_id>/``    raw ``.jsonl``, everything the harness wrote
+      (main session at the top, subagents under ``subagents/``)
+    - ``transcripts/<run_id>/`` agent-message-only ``.txt`` renderings of
+      the same files
+    """
+    projects_dir = projects_dir or default_projects_dir()
+    candidates = find_workspace_transcripts(projects_dir, workspace, started_at)
+    # The main session file is known by name; keep it even if its records
+    # somehow failed the cwd match (e.g. a run that died before writing a
+    # cwd-stamped record).
+    if session_id:
+        for path in projects_dir.rglob(f"{session_id}.jsonl"):
+            if path not in candidates:
+                candidates.append(path)
+
+    copied: list[str] = []
+    sessions_dir = logs_root / "sessions" / run_id
+    transcripts_dir = logs_root / "transcripts" / run_id
+    for path in sorted(candidates):
+        is_subagent = "subagents" in path.relative_to(projects_dir).parts
+        # A reused workspace can hold sessions from earlier runs; only the
+        # named main session (plus subagent files updated during this run,
+        # which the mtime filter already scoped) belongs to this run.
+        if not is_subagent and session_id and path.stem != session_id:
+            continue
+        subdir = Path("subagents") if is_subagent else Path()
+        raw_target = sessions_dir / subdir / path.name
+        raw_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, raw_target)
+        records, _ = _read_jsonl(path)
+        text_target = transcripts_dir / subdir / f"{path.stem}.txt"
+        text_target.parent.mkdir(parents=True, exist_ok=True)
+        text_target.write_text(agent_messages_text(records), encoding="utf-8")
+        copied.append(str(raw_target))
+    return {
+        "copied": copied,
+        "sessions_dir": str(sessions_dir),
+        "transcripts_dir": str(transcripts_dir),
+    }
+
+
 def _tool_uses(record: dict[str, Any]) -> list[dict[str, Any]]:
     message = record.get("message")
     if not isinstance(message, dict):

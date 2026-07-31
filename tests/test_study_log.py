@@ -490,3 +490,62 @@ def test_sdk_summary_records_no_error_fields_on_success():
     process = summary["process"]
     assert process["sdk_is_error"] is False
     assert process["sdk_error"] is None
+
+
+def test_agent_messages_text_keeps_only_assistant_prose():
+    # The transcripts/ rendering is the agent's words alone: tool calls,
+    # tool results, and non-assistant records stay in the raw sessions/ copy.
+    records = [
+        (1, {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}),
+        (2, {
+            "type": "assistant",
+            "timestamp": "2026-07-31T00:00:01Z",
+            "message": {"content": [
+                {"type": "text", "text": "Looking at the repo."},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            ]},
+        }),
+        (3, {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {}},
+        ]}}),
+        (4, {"type": "assistant", "timestamp": "2026-07-31T00:00:09Z",
+             "message": {"content": [{"type": "text", "text": "Done; fix applied."}]}}),
+    ]
+    text = study_log.agent_messages_text(records)
+    assert "Looking at the repo." in text and "Done; fix applied." in text
+    assert "hi" not in text          # user words excluded
+    assert "Bash" not in text        # tool calls excluded
+    assert "[assistant #1 @ 2026-07-31T00:00:01Z]" in text
+    assert "[assistant #2 @ 2026-07-31T00:00:09Z]" in text  # tool-only record not numbered
+
+
+def test_preserve_session_artifacts_copies_main_and_subagent_files(tmp_path):
+    projects = tmp_path / "projects"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = projects / "some-munged-name"
+    (project / "subagents").mkdir(parents=True)
+    record = json.dumps({
+        "type": "assistant", "cwd": str(workspace), "timestamp": _timestamp(),
+        "message": {"content": [{"type": "text", "text": "agent words"}]},
+    })
+    (project / "sess-1.jsonl").write_text(record + "\n")
+    (project / "sess-0.jsonl").write_text(record + "\n")  # older/other session
+    (project / "subagents" / "agent-x.jsonl").write_text(record + "\n")
+    logs = tmp_path / "logs"
+
+    result = study_log.preserve_session_artifacts(
+        logs,
+        run_id="run-1",
+        workspace=workspace,
+        started_at=_timestamp(-60),
+        session_id="sess-1",
+        projects_dir=projects,
+    )
+
+    assert (logs / "sessions/run-1/sess-1.jsonl").exists()
+    assert not (logs / "sessions/run-1/sess-0.jsonl").exists()  # other session excluded
+    assert (logs / "sessions/run-1/subagents/agent-x.jsonl").exists()
+    transcript = (logs / "transcripts/run-1/sess-1.txt").read_text()
+    assert "agent words" in transcript
+    assert len(result["copied"]) == 2

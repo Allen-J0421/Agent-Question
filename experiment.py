@@ -27,6 +27,7 @@ from study_log import (
     default_logs_root,
     load_evaluations,
     load_run_summaries,
+    preserve_session_artifacts,
     write_evaluation,
     write_report,
     write_run_summary,
@@ -320,6 +321,29 @@ def command_run(args: argparse.Namespace) -> None:
         "with `experiment.py evaluate` (official SWE-bench harness).",
         flush=True,
     )
+    # Preserve the raw session alongside the patch: Claude Code prunes its
+    # own copies under ~/.claude/projects on a retention schedule, and this
+    # run's trace should outlive that. Never let preservation kill a run
+    # whose summary has not been written yet.
+    try:
+        preserved = preserve_session_artifacts(
+            logs_root,
+            run_id=manifest["run_id"],
+            workspace=workspace,
+            started_at=manifest["started_at"],
+            session_id=(observation.get("result") or {}).get("session_id"),
+        )
+        if preserved["copied"]:
+            print(
+                f"Preserved {len(preserved['copied'])} raw session file(s) in "
+                f"{preserved['sessions_dir']}; agent-only transcripts in "
+                f"{preserved['transcripts_dir']}.",
+                flush=True,
+            )
+        else:
+            print("WARNING: found no session files to preserve.", flush=True)
+    except OSError as error:
+        print(f"WARNING: session preservation failed: {error}", flush=True)
     evaluation = {"status": swebench_eval.STATUS_NOT_EVALUATED, "resolved": None}
     summary = build_run_summary_sdk(manifest, observation, evaluation)
     summary_path = write_run_summary(logs_root, summary)

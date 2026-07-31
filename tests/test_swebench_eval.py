@@ -117,8 +117,17 @@ def test_capture_saves_the_patch_and_resets_the_workspace(tmp_path):
     assert Path(captured["patch_path"]).read_text(encoding="utf-8") == "THE PATCH\n"
     assert captured["changed_paths"] == ["src/thing.py"]
     assert captured["patch_bytes"] == len("THE PATCH\n")
-    assert ["checkout", "--", "."] in git.calls
-    assert ["clean", "-fd"] in git.calls
+    # Untracked files the agent created must be in the diff (intent-to-add
+    # before a diff against HEAD, which also carries staged edits) and must
+    # not survive as index entries (reset before the checkout/clean pair
+    # destroys the worktree copies).
+    assert git.calls.index(["add", "--intent-to-add", "."]) < git.calls.index(["diff", "HEAD"])
+    assert (
+        git.calls.index(["diff", "HEAD"])
+        < git.calls.index(["reset", "--quiet"])
+        < git.calls.index(["checkout", "--", "."])
+        < git.calls.index(["clean", "-fd"])
+    )
 
 
 def test_duplicate_instances_are_split_across_buckets():

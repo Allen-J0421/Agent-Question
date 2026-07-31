@@ -181,7 +181,13 @@ def capture_agent_patch(
     change -- without repeating the (expensive, non-deterministic) session.
     """
     changed = _changed_paths(run_git, workspace)
-    diff = run_git(["diff"], cwd=workspace, check=False).stdout
+    # Plain `git diff` omits files the agent *created* (untracked paths) and
+    # anything the agent happened to `git add` mid-session, and the clean-up
+    # below would then destroy the only copy of that work. Intent-to-add
+    # registers untracked files in the index without content, and diffing
+    # against HEAD captures staged and unstaged edits alike.
+    run_git(["add", "--intent-to-add", "."], cwd=workspace, check=False)
+    diff = run_git(["diff", "HEAD"], cwd=workspace, check=False).stdout
 
     patch_path = None
     if diff:
@@ -190,7 +196,10 @@ def capture_agent_patch(
         destination.write_text(diff, encoding="utf-8")
         patch_path = str(destination)
 
-    # Leave a clean checkout: prepare_workspace refuses a dirty tree.
+    # Leave a clean checkout: prepare_workspace refuses a dirty tree. The
+    # reset drops the intent-to-add entries first so checkout/clean see them
+    # as ordinary untracked files again.
+    run_git(["reset", "--quiet"], cwd=workspace, check=False)
     run_git(["checkout", "--", "."], cwd=workspace, check=False)
     run_git(["clean", "-fd"], cwd=workspace, check=False)
 
