@@ -219,9 +219,40 @@ def test_report_writes_csv_json_and_markdown(tmp_path):
     assert report["runs"]["valid_for_primary_outcome"] == 2
     assert report["runs"]["direct_ask_rate"] == 0.5
     assert "direct_asked" in paths["csv"].read_text(encoding="utf-8")
-    assert "Direct AskUserQuestion runs: 1 (50.0%)" in paths["markdown"].read_text(
-        encoding="utf-8"
-    )
+    markdown = paths["markdown"].read_text(encoding="utf-8")
+    # Headline rate, a per-run table row for each logged run, and pointers
+    # to the sibling CSV/JSON so the Markdown view is self-sufficient.
+    assert "**1/2** valid runs (50.0%)" in markdown
+    assert "asked" in markdown and "not-aske" in markdown and "unknown" in markdown
+    assert "run-summary.csv" in markdown and "askuserquestion-report.json" in markdown
+
+
+def test_build_report_breaks_out_results_by_condition():
+    # by_condition is the study's actual independent variable (ambiguous vs
+    # full); it must not collapse across conditions the way an aggregate
+    # resolve rate alone would.
+    ambiguous_resolved = {
+        **_summary("amb-1", False),
+        "task": {"instance_id": "amb-1", "condition": "ambiguous"},
+        "evaluation": {"status": "scored", "resolved": True, "localization_hit": True},
+    }
+    full_unresolved = {
+        **_summary("full-1", False),
+        "task": {"instance_id": "full-1", "condition": "full"},
+        "evaluation": {"status": "scored", "resolved": False, "localization_hit": True},
+    }
+    report = study_log.build_report([ambiguous_resolved, full_unresolved], [])
+    by_condition = report["evaluation"]["by_condition"]
+
+    assert by_condition["ambiguous"]["scored"] == 1
+    assert by_condition["ambiguous"]["resolved"] == 1
+    assert by_condition["ambiguous"]["resolve_rate"] == 1.0
+    assert by_condition["full"]["scored"] == 1
+    assert by_condition["full"]["resolved"] == 0
+    assert by_condition["full"]["resolve_rate"] == 0.0
+    # The aggregate cell (not sliced by condition) still covers both.
+    assert report["evaluation"]["resolved"] == 1
+    assert report["evaluation"]["scored"] == 2
 
 
 def _sdk_manifest():

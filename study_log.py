@@ -837,6 +837,14 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
         key = summary.get("task", {}).get("difficulty") or "unknown"
         by_difficulty.setdefault(key, []).append(summary)
 
+    # The dataset's ambiguous/full split is the study's actual independent
+    # variable; by_asked cross-tabs the (self-selected) outcome, this cross-
+    # tabs the condition itself, so a two-condition run is legible on its own.
+    by_condition: dict[str, Any] = {}
+    for summary in evaluated:
+        key = summary.get("task", {}).get("condition") or "unknown"
+        by_condition.setdefault(key, []).append(summary)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
@@ -875,6 +883,10 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
             "by_difficulty": {
                 key: _resolution_cell(rows)
                 for key, rows in sorted(by_difficulty.items())
+            },
+            "by_condition": {
+                key: _resolution_cell(rows)
+                for key, rows in sorted(by_condition.items())
             },
         },
         "secondary": {
@@ -925,6 +937,212 @@ def attach_evaluations(
         else:
             joined.append({**summary, "evaluation": stored})
     return joined
+
+
+def _pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1%}"
+
+
+def _resolution_row(label: str, cell: dict[str, Any]) -> str:
+    return (
+        f"| {label} | {cell['runs']} | {cell['scored']} | {cell['resolved']} "
+        f"| {_pct(cell['resolve_rate'])} | {cell['localization_hits']}/"
+        f"{cell['localization_checked']} | {_pct(cell['localization_rate'])} |"
+    )
+
+
+def _run_row(summary: dict[str, Any]) -> str:
+    task = summary.get("task", {})
+    process = summary.get("process", {})
+    ask = summary.get("ask_user_question", {})
+    evaluation = summary.get("evaluation", {})
+    asked = ask.get("direct_asked")
+    asked_text = {True: "yes", False: "no"}.get(asked, "?")
+    status = evaluation.get("status") or "not_evaluated"
+    if status == "scored":
+        grade = "resolved" if evaluation.get("resolved") else "unresolved"
+    else:
+        grade = status
+    duration = process.get("duration_seconds")
+    duration_text = f"{duration / 60:.1f}" if isinstance(duration, (int, float)) else "-"
+    cost = process.get("sdk_total_cost_usd")
+    cost_text = f"{cost:.2f}" if isinstance(cost, (int, float)) else "-"
+    return (
+        f"| {task.get('instance_id', '?')} | {task.get('condition', '?')} "
+        f"| {asked_text} | {grade} | {duration_text} | {cost_text} "
+        f"| {summary.get('run_id', '?')[:8]} |"
+    )
+
+
+def render_markdown_report(
+    report: dict[str, Any],
+    summaries: list[dict[str, Any]],
+    csv_path: Path,
+    json_path: Path,
+) -> str:
+    """Render the full-detail Markdown report.
+
+    The JSON report already carries every number; this renders essentially
+    all of it into one readable document instead of a short summary, so
+    reading the study's results doesn't require cross-referencing JSON keys.
+    Three views, in order: the headline numbers, results sliced the ways that
+    matter (condition, difficulty, ask), then every individual run.
+    """
+    runs = report["runs"]
+    roster = report["tool_roster"]
+    evaluation = report["evaluation"]
+    secondary = report["secondary"]
+    generated_at = report.get("generated_at", "?")
+
+    lines: list[str] = []
+    lines.append("# ambig-SWE study report")
+    lines.append("")
+    lines.append(f"Generated {generated_at} from {runs['total']} logged run(s).")
+    lines.append(
+        f"Full per-run data: [`{csv_path.name}`]({csv_path.name}) · "
+        f"raw aggregates: [`{json_path.name}`]({json_path.name})"
+    )
+    lines.append("")
+
+    # ---- Primary outcome ---------------------------------------------------
+    lines.append("## Primary outcome: did the agent ask?")
+    lines.append("")
+    lines.append(
+        f"- Direct `AskUserQuestion` calls: **{runs['direct_ask_runs']}/"
+        f"{runs['valid_for_primary_outcome']}** valid runs ({_pct(runs['direct_ask_rate'])})"
+    )
+    lines.append(
+        f"- Any agent (including subagents) asked: {runs['any_agent_ask_runs']}/"
+        f"{runs['total']} ({_pct(runs['any_agent_ask_rate'])})"
+    )
+    if runs["unknown"]:
+        lines.append(
+            f"- ⚠️ {runs['unknown']} run(s) have no observable ask outcome "
+            "(excluded from the rate above)"
+        )
+    lines.append("")
+
+    # ---- Results by condition ----------------------------------------------
+    by_condition = evaluation.get("by_condition") or {}
+    if by_condition:
+        lines.append("## Results by condition (ambiguous vs. full)")
+        lines.append("")
+        lines.append("| condition | runs | scored | resolved | resolve rate | localization | loc. rate |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for key, cell in sorted(by_condition.items()):
+            lines.append(_resolution_row(key, cell))
+        lines.append("")
+
+    # ---- Results by difficulty ----------------------------------------------
+    by_difficulty = evaluation.get("by_difficulty") or {}
+    if by_difficulty:
+        lines.append("## Results by difficulty")
+        lines.append("")
+        lines.append("| difficulty | runs | scored | resolved | resolve rate | localization | loc. rate |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for key, cell in sorted(by_difficulty.items()):
+            lines.append(_resolution_row(key, cell))
+        lines.append("")
+
+    # ---- Results by whether the agent asked --------------------------------
+    by_asked = evaluation.get("by_asked") or {}
+    if by_asked and (by_asked["asked"]["runs"] or by_asked["not_asked"]["runs"]):
+        lines.append(
+            "## Results by whether the agent asked "
+            "(self-selected, not randomized)"
+        )
+        lines.append("")
+        lines.append("| asked? | runs | scored | resolved | resolve rate | localization | loc. rate |")
+        lines.append("|---|---|---|---|---|---|---|")
+        lines.append(_resolution_row("asked", by_asked["asked"]))
+        lines.append(_resolution_row("did not ask", by_asked["not_asked"]))
+        lines.append("")
+
+    # ---- Overall patch evaluation -------------------------------------------
+    if evaluation["evaluated"]:
+        statuses = ", ".join(
+            f"{name} {count}" for name, count in sorted(evaluation["status_counts"].items())
+        )
+        lines.append("## Patch evaluation (overall)")
+        lines.append("")
+        lines.append(f"- Evaluated runs: {evaluation['evaluated']} ({statuses})")
+        lines.append(
+            f"- Resolved: {evaluation['resolved']}/{evaluation['scored']} scored "
+            f"({_pct(evaluation['resolve_rate'])})"
+        )
+        lines.append(
+            f"- Localization hits: {evaluation['localization_hits']}/"
+            f"{evaluation['localization_checked']} ({_pct(evaluation['localization_rate'])})"
+        )
+        lines.append("")
+    else:
+        lines.append("## Patch evaluation (overall)")
+        lines.append("")
+        lines.append("No runs are graded yet — run `experiment.py evaluate`.")
+        lines.append("")
+
+    # ---- Tool roster / measurement channel ----------------------------------
+    lines.append("## Measurement channel")
+    lines.append("")
+    if roster["checked"]:
+        lines.append(
+            f"- Tool roster mismatches: {roster['mismatched']}/{roster['checked']} "
+            f"SDK runs ({_pct(roster['mismatch_rate'])})"
+        )
+        if roster["mismatched_runs"]:
+            for entry in roster["mismatched_runs"]:
+                lines.append(f"  - missing: {entry['missing']}, extra: {entry['extra']}")
+    else:
+        lines.append("- No runs had a checkable tool roster.")
+    termination = report.get("termination_states") or {}
+    if termination:
+        states = ", ".join(f"{name}: {count}" for name, count in sorted(termination.items()))
+        lines.append(f"- Termination states: {states}")
+    lines.append("")
+
+    # ---- Secondary stats -----------------------------------------------------
+    lines.append("## Secondary stats")
+    lines.append("")
+    lines.append("| metric | mean | median |")
+    lines.append("|---|---|---|")
+    metric_labels = {
+        "first_ask_latency_seconds": "first-ask latency (s)",
+        "tool_actions_before_first_ask": "tool actions before first ask",
+        "questions_per_first_call": "questions per first ask call",
+        "options_per_first_call": "options per first ask call",
+        "run_duration_seconds": "run duration (s)",
+    }
+    for key, label in metric_labels.items():
+        cell = secondary.get(key) or {}
+        mean_v, median_v = cell.get("mean"), cell.get("median")
+        mean_text = f"{mean_v:.1f}" if isinstance(mean_v, (int, float)) else "n/a"
+        median_text = f"{median_v:.1f}" if isinstance(median_v, (int, float)) else "n/a"
+        lines.append(f"| {label} | {mean_text} | {median_text} |")
+    lines.append("")
+
+    # ---- Data quality ---------------------------------------------------------
+    input_errors = report.get("input_errors") or []
+    if input_errors:
+        lines.append("## Data quality")
+        lines.append("")
+        lines.append(f"- {len(input_errors)} unreadable run summary file(s):")
+        for error in input_errors:
+            lines.append(f"  - {error}")
+        lines.append("")
+
+    # ---- Every run -------------------------------------------------------------
+    lines.append("## All runs")
+    lines.append("")
+    lines.append(f"{len(summaries)} run(s), most recent first.")
+    lines.append("")
+    lines.append("| instance | condition | asked | grade | min | cost$ | run_id |")
+    lines.append("|---|---|---|---|---|---|---|")
+    ordered = sorted(summaries, key=lambda s: s.get("started_at") or "", reverse=True)
+    for summary in ordered:
+        lines.append(_run_row(summary))
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
 
 
 def write_report(logs_root: Path) -> dict[str, Path]:
@@ -988,63 +1206,8 @@ def write_report(logs_root: Path) -> dict[str, Path]:
                 }
             )
 
-    runs = report["runs"]
-    rate = runs["direct_ask_rate"]
-    rate_text = "n/a" if rate is None else f"{rate:.1%}"
-    roster = report["tool_roster"]
-    if roster["checked"]:
-        mismatch_rate_text = (
-            "n/a" if roster["mismatch_rate"] is None else f"{roster['mismatch_rate']:.1%}"
-        )
-        roster_line = (
-            f"- Tool roster mismatches: {roster['mismatched']}/{roster['checked']} "
-            f"SDK runs ({mismatch_rate_text}) — see tool_roster.mismatched_runs in the JSON report\n"
-        )
-    else:
-        roster_line = ""
-
-    evaluation = report["evaluation"]
-    if evaluation["evaluated"]:
-        def _cell(label: str, cell: dict[str, Any]) -> str:
-            rate = cell["resolve_rate"]
-            text = "n/a" if rate is None else f"{rate:.1%}"
-            return (
-                f"  - {label}: {cell['resolved']}/{cell['scored']} scored ({text})\n"
-            )
-
-        statuses = ", ".join(
-            f"{name} {count}"
-            for name, count in sorted(evaluation["status_counts"].items())
-        )
-        localization_rate = evaluation["localization_rate"]
-        localization_text = (
-            "n/a" if localization_rate is None else f"{localization_rate:.1%}"
-        )
-        overall_rate = evaluation["resolve_rate"]
-        overall_text = "n/a" if overall_rate is None else f"{overall_rate:.1%}"
-        evaluation_line = (
-            "\n## Patch evaluation\n\n"
-            f"- Evaluated runs: {evaluation['evaluated']} ({statuses})\n"
-            f"- Resolved: {evaluation['resolved']}/{evaluation['scored']} scored "
-            f"({overall_text})\n"
-            f"- Localization hits: {evaluation['localization_hits']}/"
-            f"{evaluation['localization_checked']} ({localization_text})\n"
-            "- Resolution by whether the agent asked "
-            "(self-selected, not randomized — see by_difficulty in the JSON):\n"
-            + _cell("asked", evaluation["by_asked"]["asked"])
-            + _cell("did not ask", evaluation["by_asked"]["not_asked"])
-        )
-    else:
-        evaluation_line = ""
-
     markdown_path.write_text(
-        "# AskUserQuestion report\n\n"
-        f"- Runs logged: {runs['total']}\n"
-        f"- Valid primary-outcome runs: {runs['valid_for_primary_outcome']}\n"
-        f"- Direct AskUserQuestion runs: {runs['direct_ask_runs']} ({rate_text})\n"
-        f"- Unknown runs: {runs['unknown']}\n"
-        f"{roster_line}"
-        f"{evaluation_line}",
+        render_markdown_report(report, summaries, csv_path, json_path),
         encoding="utf-8",
     )
     return {"json": json_path, "csv": csv_path, "markdown": markdown_path}

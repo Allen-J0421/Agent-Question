@@ -11,16 +11,24 @@ Stdlib only, touches nothing on disk, and never guesses: every check reads
 the same records the experiment itself wrote. Exit code is 0 when nothing
 needs attention and 1 otherwise, so it can gate automation.
 
+The one exception is ``--clean-dead``, an opt-in write: it quarantines dead
+runs and interrupted sessions (manifest, no summary) into
+``archive/<date>-clean-dead/`` -- the same move-not-delete convention used by
+hand -- so the instance becomes retryable again, then prints the exact
+``experiment.py run`` commands to rerun each one.
+
 Usage:
     python3 sanity_check.py                 # all runs, most recent first
     python3 sanity_check.py --last 10       # only the 10 most recent runs
     python3 sanity_check.py --logs-dir DIR  # e.g. an archive folder
+    python3 sanity_check.py --clean-dead    # quarantine dead/interrupted runs, print rerun commands
 """
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -195,6 +203,81 @@ def dangling_relative_imports(patch_text: str, workspace: Path) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Quarantine (the one write path; opt-in via --clean-dead)
+# --------------------------------------------------------------------------
+
+# Every place a run's or manifest's artifacts can live, keyed by the same
+# run_id/manifest stem. Moving all of them together is what makes the
+# instance disappear from resume state, the run table, and every other
+# section in one step, while keeping the evidence instead of deleting it.
+ARTIFACT_SUBDIRS = [
+    "runs", "manifests", "patches", "evaluations", "sessions", "transcripts",
+]
+
+
+def _quarantine_stem(logs: Path, quarantine: Path, stem: str) -> list[str]:
+    """Move every artifact named ``stem`` (a run_id or manifest id) out of
+    the live logs and into ``quarantine``, mirroring the live layout.
+    Returns the relative paths moved."""
+    moved = []
+    for sub in ARTIFACT_SUBDIRS:
+        src_dir = logs / sub
+        for src in (src_dir / f"{stem}.json", src_dir / f"{stem}.patch", src_dir / stem):
+            if not src.exists():
+                continue
+            dest = quarantine / sub / src.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            moved.append(f"{sub}/{src.name}")
+    return moved
+
+
+def clean_dead(
+    logs: Path,
+    summaries: list[dict],
+    manifests: dict[str, dict],
+    runs: dict[str, dict],
+    today: str,
+) -> list[dict]:
+    """Quarantine dead runs and interrupted sessions; return what was cleaned.
+
+    Each entry describes one quarantined instance so the caller can print
+    exact rerun commands afterward -- the whole point of cleaning dead runs
+    is to make them rerunnable, so the command has to come out the other end.
+    """
+    to_clean: list[dict] = []
+    for summary in summaries:
+        if classify(summary) != "dead":
+            continue
+        rid = summary.get("run_id")
+        if not rid:
+            continue
+        task = summary.get("task", {})
+        to_clean.append({
+            "kind": "dead", "stem": rid, "instance_id": task.get("instance_id"),
+            "condition": task.get("condition"),
+            "model": summary.get("claude", {}).get("model"),
+        })
+    for mid, manifest in manifests.items():
+        if mid in runs:
+            continue  # not orphaned -- has a matching run summary
+        task = manifest.get("task", {})
+        to_clean.append({
+            "kind": "interrupted", "stem": mid, "instance_id": task.get("instance_id"),
+            "condition": task.get("condition"),
+            "model": manifest.get("claude", {}).get("model"),
+        })
+
+    if not to_clean:
+        return []
+
+    quarantine = logs / "archive" / f"{today}-clean-dead"
+    for entry in to_clean:
+        entry["moved"] = _quarantine_stem(logs, quarantine, entry["stem"])
+    return to_clean
+
+
+# --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
 
@@ -203,6 +286,10 @@ def main() -> int:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--logs-dir", default=".experiment-logs")
     cli.add_argument("--last", type=int, help="only the N most recent runs")
+    cli.add_argument(
+        "--clean-dead", action="store_true",
+        help="quarantine dead runs and interrupted sessions, then print rerun commands",
+    )
     args = cli.parse_args()
 
     logs = Path(args.logs_dir)
@@ -464,10 +551,40 @@ def main() -> int:
     if problems:
         for problem in problems:
             print(f"  {BAD} {problem}")
-        print(f"  {BAD} verdict: NEEDS ATTENTION")
-        return 1
-    print(f"  {OK} verdict: healthy")
-    return 0
+    verdict_bad = bool(problems)
+    print(f"  {BAD if verdict_bad else OK} verdict: {'NEEDS ATTENTION' if verdict_bad else 'healthy'}")
+
+    # ---- 8. Clean dead runs (opt-in write) ---------------------------------
+    if args.clean_dead:
+        print("\nCLEAN-DEAD")
+        cleaned = clean_dead(logs, summaries, manifests, runs, today=datetime.now().strftime("%Y-%m-%d"))
+        if not cleaned:
+            print(f"  {OK} nothing to clean — no dead runs or interrupted sessions in scope")
+        else:
+            for entry in cleaned:
+                print(
+                    f"  quarantined {entry['kind']:11s} {entry['stem'][:8]}  "
+                    f"{entry['instance_id']}  ({len(entry['moved'])} file(s) moved)"
+                )
+            quarantine_dir = logs / "archive" / f"{datetime.now().strftime('%Y-%m-%d')}-clean-dead"
+            print(f"  {OK} moved {len(cleaned)} instance(s) to {quarantine_dir}")
+            print("\n  Rerun with:")
+            py = sys.executable
+            for entry in cleaned:
+                if not entry["instance_id"] or not entry["condition"]:
+                    print(
+                        f"  # {entry['stem'][:8]}: missing instance_id/condition "
+                        "(manifest unreadable?) — resolve manually"
+                    )
+                    continue
+                model_flag = f" --model {entry['model']}" if entry.get("model") else ""
+                print(
+                    f"  {py} experiment.py run {entry['instance_id']} "
+                    f"--condition {entry['condition']}{model_flag}"
+                )
+        return 1  # quarantining just proved something needed attention
+
+    return 0 if not verdict_bad else 1
 
 
 if __name__ == "__main__":
