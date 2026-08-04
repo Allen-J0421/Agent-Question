@@ -310,6 +310,19 @@ def test_sdk_summary_records_stop_on_first_ask_and_permission_mode():
     assert summary["permissions"]["prompts_reaching_callback"] == 3
 
 
+def test_sdk_summary_labels_an_ask_cap_stop_like_the_codex_arm():
+    # Both arms cap synthetic answers per run; the run summary uses the same
+    # stop_reason label so capped runs from either arm sort together.
+    first = {"tool_use_id": "tu-1", "latency_seconds": 1.0, "input": {"questions": []}}
+    observation = _sdk_observation(first, hit_ask_cap=True, max_ask_rounds=3)
+    summary = study_log.build_run_summary_sdk(_sdk_manifest(), observation)
+
+    assert summary["process"]["stop_reason"] == "max_ask_rounds"
+    assert summary["ask_user_question"]["hit_ask_cap"] is True
+    assert summary["ask_user_question"]["max_ask_rounds"] == 3
+    assert summary["ask_user_question"]["direct_asked"] is True
+
+
 def test_sdk_summary_without_ask_keeps_model_stop_reason_and_null_latency():
     summary = study_log.build_run_summary_sdk(_sdk_manifest(), _sdk_observation(None))
 
@@ -548,6 +561,228 @@ def test_agent_messages_text_keeps_only_assistant_prose():
     assert "Bash" not in text        # tool calls excluded
     assert "[assistant #1 @ 2026-07-31T00:00:01Z]" in text
     assert "[assistant #2 @ 2026-07-31T00:00:09Z]" in text  # tool-only record not numbered
+
+
+def test_agent_info_reads_both_record_generations():
+    legacy = {"claude": {"model": "claude-opus-4-8", "interface": "sdk"}}
+    modern = {"agent": {"model": "gpt-5.6-sol", "runner": "codex-cli"}}
+    assert study_log.agent_info(legacy) == {
+        "model": "claude-opus-4-8", "interface": "sdk", "runner": "claude-sdk",
+    }
+    assert study_log.agent_info(modern)["runner"] == "codex-cli"
+    assert study_log.agent_info({}) == {}
+
+
+def _codex_manifest():
+    return {
+        "run_id": "codex-run",
+        "started_at": _timestamp(),
+        "task": {"instance_id": "owner__repo-1", "condition": "ambiguous"},
+        "agent": {
+            "model": "gpt-5.6-sol",
+            "runner": "codex-cli",
+            "cli_version": "codex-cli 0.146.0",
+            "sandbox": "danger-full-access",
+        },
+        "workspace": "/tmp/workspace",
+    }
+
+
+def _codex_observation(first_direct=None, **overrides):
+    asked = first_direct is not None
+    observation = {
+        "runner": "codex-cli",
+        "model": "gpt-5.6-sol",
+        "sandbox": "danger-full-access",
+        "ask_channel": "final_message",
+        "ask_classifier_version": 6,
+        "max_ask_rounds": 3,
+        "neutral_answer": "Up to you.",
+        "thread_id": "thread-1",
+        "started_at": _timestamp(),
+        "ended_at": _timestamp(1),
+        "rounds": [
+            {"index": 1, "prompt_kind": "task", "prompt": "Resolve...", "asked": asked,
+             "tool_actions": 5, "exit_code": 0, "duration_seconds": 60.0,
+             "agent_messages": ["working", "final words"]},
+        ],
+        "tool_actions_total": 5,
+        "answered_questions": (
+            [{"round": 1, "question_text": "A or B?", "reply": "Up to you."}] if asked else []
+        ),
+        "result": {
+            "subtype": "completed", "is_error": False, "num_turns": 1,
+            "duration_ms": 60000, "session_id": "thread-1",
+            "stop_reason": "completed", "total_cost_usd": None,
+            "usage": {"input_tokens": 10, "output_tokens": 4}, "result": None,
+        },
+        "analysis": {
+            "first_direct": first_direct,
+            "direct_count": 1 if asked else 0,
+            "any_agent_count": 1 if asked else 0,
+        },
+    }
+    observation.update(overrides)
+    return observation
+
+
+def test_codex_summary_records_the_final_message_ask_channel():
+    first = {
+        "round": 1,
+        "timestamp": _timestamp(),
+        "latency_seconds": 42.0,
+        "message_text": "Should I cap the value or raise?",
+        "assistant_tool_actions_before": 5,
+        "workspace_had_changes": False,
+    }
+    summary = study_log.build_run_summary_codex(_codex_manifest(), _codex_observation(first))
+
+    ask = summary["ask_user_question"]
+    assert ask["channel"] == "final_message"
+    assert ask["classifier_version"] == 6
+    assert ask["direct_asked"] is True
+    assert ask["first_direct"]["message_text"] == "Should I cap the value or raise?"
+    assert ask["first_direct_latency_seconds"] == 42.0
+    assert ask["answered_questions"][0]["reply"] == "Up to you."
+    assert summary["agent"]["model"] == "gpt-5.6-sol"
+    assert summary["agent"]["runner"] == "codex-cli"
+    assert summary["process"]["codex_thread_id"] == "thread-1"
+    assert summary["session"]["ran_meaningfully"] is True
+    assert summary["session"]["monitoring_status"] == "observed_ask"
+
+
+def test_codex_summary_counts_a_working_no_ask_session_as_an_observation():
+    summary = study_log.build_run_summary_codex(_codex_manifest(), _codex_observation(None))
+    assert summary["ask_user_question"]["direct_asked"] is False
+    assert summary["session"]["monitoring_status"] == "complete_no_ask"
+
+
+def test_codex_summary_marks_a_session_that_never_worked_as_unknown():
+    # No tool actions and no ask: the model observed nothing about the ask
+    # decision, so it must not enter the ask-rate denominator.
+    observation = _codex_observation(None, tool_actions_total=0)
+    summary = study_log.build_run_summary_codex(_codex_manifest(), observation)
+    assert summary["ask_user_question"]["direct_asked"] is None
+    assert summary["session"]["ran_meaningfully"] is False
+    assert summary["session"]["monitoring_status"] == "no_work_performed"
+
+
+def test_codex_summary_persists_error_evidence():
+    observation = _codex_observation(
+        None,
+        result={
+            "subtype": "error", "is_error": True, "num_turns": 1,
+            "duration_ms": 100, "session_id": "thread-1", "stop_reason": "error",
+            "total_cost_usd": None, "usage": {},
+            "result": "model requires a newer version of Codex",
+        },
+    )
+    summary = study_log.build_run_summary_codex(_codex_manifest(), observation)
+    process = summary["process"]
+    assert process["codex_is_error"] is True
+    assert "newer version of Codex" in process["codex_error"]
+    assert summary["ask_user_question"]["direct_asked"] is None
+
+
+def _codex_report_summary(run_id, asked, condition="ambiguous", evaluation=None):
+    summary = {
+        "run_id": run_id,
+        "task": {"instance_id": run_id, "condition": condition},
+        "agent": {"model": "gpt-5.6-sol", "runner": "codex-cli"},
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "ended_at": "2026-01-01T00:01:00+00:00",
+        "process": {"exit_code": 0, "stop_reason": "completed"},
+        "session": {"monitoring_status": "complete_no_ask"},
+        "ask_user_question": {
+            "channel": "final_message",
+            "direct_asked": asked,
+            "direct_count": int(asked is True),
+            "any_agent_count": int(asked is True),
+            "first_direct": {"message_text": "A or B?"} if asked else None,
+            "first_direct_latency_seconds": 5.0 if asked else None,
+        },
+    }
+    if evaluation:
+        summary["evaluation"] = evaluation
+    return summary
+
+
+def test_report_keeps_models_apart_and_supports_comparison(tmp_path):
+    # Two arms over the same instances: aggregates must never pool models,
+    # and legacy claude-keyed summaries must land in their own arm.
+    logs_root = tmp_path / "logs"
+    study_log.write_run_summary(
+        logs_root, {**_eval_summary("claude-amb", True, _eval(resolved=True)),
+                    "task": {"instance_id": "i1", "condition": "ambiguous"}},
+    )
+    study_log.write_run_summary(
+        logs_root, {**_codex_report_summary("gpt-amb", False, evaluation=_eval(resolved=False)),
+                    "task": {"instance_id": "i1", "condition": "ambiguous"}},
+    )
+    study_log.write_run_summary(
+        logs_root, {**_codex_report_summary("gpt-full", False, evaluation=_eval(resolved=True)),
+                    "task": {"instance_id": "i1", "condition": "full"}},
+    )
+
+    paths = study_log.write_report(logs_root)
+    report = json.loads(paths["json"].read_text(encoding="utf-8"))
+    models = report["models"]
+
+    assert set(models) == {"claude-opus-4-8", "gpt-5.6-sol"}
+    claude_cell = models["claude-opus-4-8"]
+    gpt_cell = models["gpt-5.6-sol"]
+    assert claude_cell["ask"] == {"runs": 1, "valid": 1, "asked": 1, "ask_rate": 1.0}
+    assert gpt_cell["ask"] == {"runs": 2, "valid": 2, "asked": 0, "ask_rate": 0.0}
+    # Channel provenance stays attached to each arm.
+    assert claude_cell["ask_channels"] == {"askuserquestion_tool": 1}
+    assert gpt_cell["ask_channels"] == {"final_message": 2}
+    # Per-model condition split supports the ambiguous-vs-full comparison.
+    assert gpt_cell["by_condition"]["ambiguous"]["resolution"]["resolved"] == 0
+    assert gpt_cell["by_condition"]["full"]["resolution"]["resolved"] == 1
+    assert claude_cell["by_condition"]["ambiguous"]["ask"]["ask_rate"] == 1.0
+
+    csv_text = paths["csv"].read_text(encoding="utf-8")
+    assert "runner" in csv_text and "ask_channel" in csv_text
+    assert "codex-cli" in csv_text and "final_message" in csv_text
+
+    markdown = paths["markdown"].read_text(encoding="utf-8")
+    assert "## Model comparison" in markdown
+    assert "gpt-5.6-sol" in markdown and "claude-opus-4-8" in markdown
+
+
+def test_codex_transcript_marks_the_final_message_of_each_round():
+    rounds = [
+        {"index": 1, "prompt_kind": "task", "prompt": "Fix it.",
+         "agent_messages": ["digging in", "Should I do A or B?"]},
+        {"index": 2, "prompt_kind": "synthetic_answer", "prompt": "Up to you.",
+         "agent_messages": ["DONE"]},
+    ]
+    text = study_log.codex_rounds_text(rounds)
+    assert "[round 1 :: agent commentary]" in text and "digging in" in text
+    assert "[round 1 :: agent final]" in text and "Should I do A or B?" in text
+    assert "[round 2 :: synthetic_answer prompt]" in text
+    assert "[round 2 :: agent final]" in text and "DONE" in text
+
+
+def test_preserve_codex_session_artifacts_copies_rollouts_and_transcript(tmp_path):
+    codex_home = tmp_path / "codex-home"
+    rollout = codex_home / "sessions" / "2026" / "08" / "01" / "rollout-x-thread-9.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("{}\n", encoding="utf-8")
+    logs = tmp_path / "logs"
+
+    result = study_log.preserve_codex_session_artifacts(
+        logs,
+        run_id="run-1",
+        thread_id="thread-9",
+        rounds=[{"index": 1, "prompt_kind": "task", "prompt": "p",
+                 "agent_messages": ["words"]}],
+        codex_home=codex_home,
+    )
+
+    assert (logs / "sessions/run-1/rollout-x-thread-9.jsonl").exists()
+    assert "words" in (logs / "transcripts/run-1/rounds.txt").read_text(encoding="utf-8")
+    assert len(result["copied"]) == 1
 
 
 def test_preserve_session_artifacts_copies_main_and_subagent_files(tmp_path):

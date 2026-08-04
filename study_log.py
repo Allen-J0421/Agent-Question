@@ -1,8 +1,11 @@
-"""Capture and report spontaneous AskUserQuestion use in Claude Code sessions.
+"""Capture and report spontaneous user-directed questions across study arms.
 
-Claude Code writes its own session transcript beneath ``~/.claude/projects``.  This
-module only observes those records; it does not alter Claude's prompt, tools,
-permissions, or output mode.
+Manifests, run summaries, session preservation, and the aggregate report for
+both runners: Claude Agent SDK sessions (ask channel: the AskUserQuestion
+tool) and Codex CLI sessions (ask channel: a turn-ending clarifying question
+in the final message). This module only observes each harness's own records;
+it never alters an agent's prompt, tools, permissions, or output mode.
+Reports and CSVs always keep models apart -- each model is its own study arm.
 """
 from __future__ import annotations
 
@@ -43,6 +46,40 @@ def prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
+def agent_info(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the runner/model identity of a manifest or run summary.
+
+    Multi-runner records store it under ``agent`` (``{"model", "runner",
+    ...}``). Records written before the multi-runner change stored it under
+    ``claude`` -- implicitly the Claude runner, with ``interface`` saying
+    whether it was the transcript-tailing CLI path or the Agent SDK path.
+    Every reader goes through this helper so both generations of records
+    aggregate together instead of silently splitting the dataset.
+    """
+    agent = record.get("agent")
+    if isinstance(agent, dict):
+        return agent
+    legacy = record.get("claude")
+    if isinstance(legacy, dict):
+        runner = "claude-sdk" if legacy.get("interface", "sdk") == "sdk" else "claude-cli"
+        return {**legacy, "runner": runner}
+    return {}
+
+
+def ask_channel_of(summary: dict[str, Any]) -> str | None:
+    """The channel a run's ask outcome was observed on.
+
+    Explicit on new summaries (``ask_user_question.channel``); Claude
+    summaries written before the field existed could only ever observe the
+    AskUserQuestion tool.
+    """
+    channel = summary.get("ask_user_question", {}).get("channel")
+    if channel:
+        return channel
+    runner = agent_info(summary).get("runner") or ""
+    return "askuserquestion_tool" if runner.startswith("claude") else None
+
+
 def write_new_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as handle:
@@ -58,23 +95,24 @@ def create_run_manifest(
     model: str,
     workspace: Path,
     prompt: str,
-    interface: str = "cli",
-    claude_bin: str | None = None,
+    runner: str = "claude-sdk",
+    runner_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist immutable pre-launch metadata and return the manifest.
 
-    ``interface`` is ``"cli"`` (subprocess ``claude -p``, no callback
-    mechanism -- AskUserQuestion is structurally unreachable there) or
-    ``"sdk"`` (Agent SDK session with a ``can_use_tool`` callback, required
-    for AskUserQuestion to appear in the tool roster at all). Every summary
-    is stamped with this so historical CLI-path runs and current SDK-path
-    runs are never silently conflated in analysis.
+    ``runner`` names the harness the session runs through and therefore
+    which ask channel is even reachable: ``"claude-sdk"`` (Agent SDK session
+    with a ``can_use_tool`` callback; the AskUserQuestion tool is the ask
+    channel) or ``"codex-cli"`` (stock ``codex exec``; the final-message
+    turn yield is the ask channel -- vanilla Codex has no question tool).
+    ``runner_details`` carries runner-specific facts worth pinning before
+    launch (CLI version, sandbox mode, argv shape). Every summary inherits
+    this block, so runs from different runners and models are never
+    silently conflated in analysis. Records written before the multi-runner
+    change carry the same identity under a ``claude`` key; ``agent_info``
+    reads both.
     """
     run_id = str(uuid.uuid4())
-    claude_info: dict[str, Any] = {"model": model, "interface": interface}
-    if interface == "cli":
-        claude_info["binary"] = claude_bin
-        claude_info["argv_shape"] = ["claude", "--model", model, "<prompt>"]
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -87,7 +125,7 @@ def create_run_manifest(
             "condition": condition,
             "prompt_sha256": prompt_hash(prompt),
         },
-        "claude": claude_info,
+        "agent": {"model": model, "runner": runner, **(runner_details or {})},
         "workspace": str(workspace.resolve()),
     }
     write_new_json(logs_root / "manifests" / f"{run_id}.json", manifest)
@@ -237,6 +275,79 @@ def preserve_session_artifacts(
         text_target.parent.mkdir(parents=True, exist_ok=True)
         text_target.write_text(agent_messages_text(records), encoding="utf-8")
         copied.append(str(raw_target))
+    return {
+        "copied": copied,
+        "sessions_dir": str(sessions_dir),
+        "transcripts_dir": str(transcripts_dir),
+    }
+
+
+def default_codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def codex_rounds_text(rounds: list[dict[str, Any]] | None) -> str:
+    """Render a Codex run's agent-only transcript, one block per message.
+
+    The last agent message of a round is the final channel -- the message
+    that yielded the turn (and, when classified as a question, the ask
+    itself) -- so it is marked apart from mid-turn commentary.
+    """
+    parts: list[str] = []
+    for entry in rounds or []:
+        index = entry.get("index")
+        parts.append(f"[round {index} :: {entry.get('prompt_kind')} prompt]")
+        parts.append(str(entry.get("prompt") or "").strip())
+        parts.append("")
+        messages = entry.get("agent_messages") or []
+        for position, message in enumerate(messages):
+            marker = "final" if position == len(messages) - 1 else "commentary"
+            parts.append(f"[round {index} :: agent {marker}]")
+            parts.append(message)
+            parts.append("")
+    return "\n".join(parts).rstrip() + ("\n" if parts else "")
+
+
+def preserve_codex_session_artifacts(
+    logs_root: Path,
+    *,
+    run_id: str,
+    thread_id: str | None,
+    rounds: list[dict[str, Any]] | None,
+    codex_home: Path | None = None,
+) -> dict[str, Any]:
+    """Copy Codex's own rollout files and render an agent-only transcript.
+
+    The launcher already streamed each round's ``--json`` events into
+    ``sessions/<run_id>/`` while the session ran; this adds the CLI's own
+    rollout ``.jsonl`` from ``$CODEX_HOME/sessions`` (subject to Codex's own
+    retention, exactly like Claude's ``~/.claude/projects``) and writes
+    ``transcripts/<run_id>/rounds.txt`` -- the same two artifact slots the
+    Claude path fills, so ``locate_logs.py`` needs no per-runner cases.
+    """
+    codex_home = codex_home or default_codex_home()
+    sessions_dir = logs_root / "sessions" / run_id
+    transcripts_dir = logs_root / "transcripts" / run_id
+
+    copied: list[str] = []
+    if thread_id:
+        for root_name in ("sessions", "archived_sessions"):
+            root = codex_home / root_name
+            if not root.exists():
+                continue
+            for path in sorted(root.rglob(f"*{thread_id}*.jsonl")):
+                sessions_dir.mkdir(parents=True, exist_ok=True)
+                target = sessions_dir / path.name
+                try:
+                    shutil.copy2(path, target)
+                except OSError:
+                    continue
+                copied.append(str(target))
+
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    (transcripts_dir / "rounds.txt").write_text(
+        codex_rounds_text(rounds), encoding="utf-8"
+    )
     return {
         "copied": copied,
         "sessions_dir": str(sessions_dir),
@@ -508,7 +619,7 @@ def build_run_summary(
         "started_at": manifest["started_at"],
         "ended_at": ended_at,
         "task": manifest["task"],
-        "claude": manifest["claude"],
+        "agent": agent_info(manifest),
         "workspace": manifest["workspace"],
         "process": {
             "exit_code": observation["exit_code"],
@@ -616,12 +727,16 @@ def build_run_summary_sdk(
         "started_at": manifest["started_at"],
         "ended_at": ended_at,
         "task": manifest["task"],
-        "claude": manifest["claude"],
+        "agent": agent_info(manifest),
         "workspace": manifest["workspace"],
         "process": {
             "exit_code": 1 if result.get("is_error") else 0,
             "stop_reason": (
-                "stopped_on_first_ask"
+                # Same label the Codex arm uses when an ask beyond the
+                # synthetic-answer cap ends the session.
+                "max_ask_rounds"
+                if observation.get("hit_ask_cap")
+                else "stopped_on_first_ask"
                 if observation.get("stopped_on_first_ask")
                 else result.get("stop_reason") or result.get("subtype")
             ),
@@ -669,10 +784,139 @@ def build_run_summary_sdk(
             "extra_in_actual": extra_in_actual,
         },
         "ask_user_question": {
+            "channel": "askuserquestion_tool",
+            "max_ask_rounds": observation.get("max_ask_rounds"),
+            "hit_ask_cap": observation.get("hit_ask_cap"),
             "direct_asked": direct_asked,
             "direct_count": analysis["direct_count"],
             "any_agent_count": analysis["any_agent_count"],
             "first_direct": first_summary,
+            "first_direct_latency_seconds": (
+                first.get("latency_seconds") if first is not None else None
+            ),
+            "answered_questions": observation.get("answered_questions") or [],
+        },
+    }
+
+
+def build_run_summary_codex(
+    manifest: dict[str, Any],
+    observation: dict[str, Any],
+    evaluation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a run summary from a ``codex_runner.run_codex_session`` observation.
+
+    Field-compatible with ``build_run_summary_sdk`` wherever the underlying
+    data means the same thing (task, ask outcome, evaluation, duration), and
+    explicit where it does not: ``ask_user_question.channel`` is
+    ``final_message`` because vanilla Codex has no question tool -- the
+    observed ask is a turn that ended with a clarifying question, classified
+    by the versioned deterministic rule recorded alongside it.
+    ``first_direct`` therefore carries the question's message text rather
+    than tool input, plus ``workspace_had_changes`` so pre-work clarifying
+    questions can be separated from post-work offers in analysis.
+
+    ``ran_meaningfully`` mirrors the SDK builder's intent with the signals
+    this runner has: a session that errored, or that ended without either a
+    tool action or an ask, observed nothing about the ask decision and must
+    not enter the ask-rate denominator.
+    """
+    analysis = observation["analysis"]
+    first = analysis["first_direct"]
+
+    started = _parse_timestamp(manifest["started_at"])
+    ended_at = utc_now()
+    ended = _parse_timestamp(ended_at)
+    duration = (
+        (ended - started).total_seconds()
+        if started is not None and ended is not None
+        else None
+    )
+
+    result = observation.get("result") or {}
+    tool_actions = observation.get("tool_actions_total") or 0
+    ran_meaningfully = not result.get("is_error") and (
+        tool_actions > 0 or analysis["direct_count"] > 0
+    )
+    if first is not None:
+        direct_asked: bool | None = True
+    elif ran_meaningfully:
+        direct_asked = False
+    else:
+        direct_asked = None
+
+    # Compact per-round digest: prompts, agent messages, and raw events stay
+    # in sessions/ and transcripts/; the summary keeps the shape of the run.
+    round_digest = [
+        {
+            "index": entry.get("index"),
+            "prompt_kind": entry.get("prompt_kind"),
+            "asked": entry.get("asked"),
+            "turn_edited": entry.get("turn_edited"),
+            "regex_asked": entry.get("regex_asked"),
+            "tool_actions": entry.get("tool_actions"),
+            "file_changes": entry.get("file_changes"),
+            "exit_code": entry.get("exit_code"),
+            "duration_seconds": entry.get("duration_seconds"),
+        }
+        for entry in observation.get("rounds") or []
+    ]
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": manifest["run_id"],
+        "started_at": manifest["started_at"],
+        "ended_at": ended_at,
+        "task": manifest["task"],
+        "agent": agent_info(manifest),
+        "workspace": manifest["workspace"],
+        "process": {
+            "exit_code": 1 if result.get("is_error") else 0,
+            "stop_reason": result.get("stop_reason") or result.get("subtype"),
+            "operator_interrupted": False,
+            "duration_seconds": duration,
+            "codex_thread_id": result.get("session_id"),
+            "codex_rounds": result.get("num_turns"),
+            "codex_token_usage": result.get("usage"),
+            "codex_is_error": bool(result.get("is_error")),
+            "codex_error": (
+                str(result.get("result"))[:2000]
+                if result.get("is_error") and result.get("result")
+                else None
+            ),
+        },
+        "sandbox": {
+            "mode": observation.get("sandbox"),
+            # codex exec has no interactive approval channel; the model is
+            # told approvals are unavailable rather than pausing for them.
+            "approval_policy": "never",
+        },
+        "session": {
+            "ran_meaningfully": ran_meaningfully,
+            "monitoring_status": (
+                "observed_ask"
+                if first is not None
+                else "complete_no_ask"
+                if ran_meaningfully
+                else "no_work_performed"
+            ),
+            "rounds": round_digest,
+            "tool_actions_total": tool_actions,
+        },
+        "evaluation": evaluation or {"status": "not_evaluated", "resolved": None},
+        "ask_user_question": {
+            "channel": observation.get("ask_channel"),
+            "classifier_version": observation.get("ask_classifier_version"),
+            "gate": observation.get("ask_gate"),
+            "max_ask_rounds": observation.get("max_ask_rounds"),
+            "neutral_answer": observation.get("neutral_answer"),
+            "direct_asked": direct_asked,
+            "direct_count": analysis["direct_count"],
+            "any_agent_count": analysis["any_agent_count"],
+            # Regex fired on an edited turn (gated to not-asked). Zero in
+            # all harvested data; non-zero flags the gate assumption.
+            "questions_with_edits": analysis.get("questions_with_edits"),
+            "first_direct": dict(first) if first is not None else None,
             "first_direct_latency_seconds": (
                 first.get("latency_seconds") if first is not None else None
             ),
@@ -781,6 +1025,63 @@ def _resolution_cell(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _ask_cell(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Ask-rate counts over one slice of runs.
+
+    ``valid`` excludes runs whose ask outcome is unobservable (errored or
+    no-work sessions record ``direct_asked: null``), matching the top-level
+    primary-outcome denominator.
+    """
+    asks = [summary.get("ask_user_question", {}) for summary in summaries]
+    valid = [ask for ask in asks if isinstance(ask.get("direct_asked"), bool)]
+    asked = sum(ask.get("direct_asked") is True for ask in valid)
+    return {
+        "runs": len(summaries),
+        "valid": len(valid),
+        "asked": asked,
+        "ask_rate": asked / len(valid) if valid else None,
+    }
+
+
+def _model_cells(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-model (and per model x condition) slices of ask and resolution.
+
+    Models are separate arms of the study and their ask channels differ
+    (Claude: AskUserQuestion tool call; Codex/GPT: final-message question),
+    so nothing here is ever pooled across models -- ``ask_channels`` records
+    which channel each slice was measured on so the comparison stays honest.
+    """
+    by_model: dict[str, list[dict[str, Any]]] = {}
+    for summary in summaries:
+        model = agent_info(summary).get("model") or "unknown"
+        by_model.setdefault(model, []).append(summary)
+
+    cells: dict[str, Any] = {}
+    for model, rows in sorted(by_model.items()):
+        channels: dict[str, int] = {}
+        for summary in rows:
+            channel = ask_channel_of(summary) or "unknown"
+            channels[channel] = channels.get(channel, 0) + 1
+        by_condition: dict[str, list[dict[str, Any]]] = {}
+        for summary in rows:
+            key = summary.get("task", {}).get("condition") or "unknown"
+            by_condition.setdefault(key, []).append(summary)
+        cells[model] = {
+            "runner": agent_info(rows[0]).get("runner"),
+            "ask_channels": channels,
+            "ask": _ask_cell(rows),
+            "resolution": _resolution_cell(rows),
+            "by_condition": {
+                condition: {
+                    "ask": _ask_cell(sub),
+                    "resolution": _resolution_cell(sub),
+                }
+                for condition, sub in sorted(by_condition.items())
+            },
+        }
+    return cells
+
+
 def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> dict[str, Any]:
     asks = [summary.get("ask_user_question", {}) for summary in summaries]
     valid = [ask for ask in asks if isinstance(ask.get("direct_asked"), bool)]
@@ -858,6 +1159,10 @@ def build_report(summaries: list[dict[str, Any]], input_errors: list[str]) -> di
             "any_agent_ask_runs": any_agent_ask_runs,
             "any_agent_ask_rate": any_agent_ask_runs / len(summaries) if summaries else None,
         },
+        # Each model is its own study arm; nothing in this section pools
+        # across models, and the ask channel each arm was measured on is
+        # recorded next to its rates.
+        "models": _model_cells(summaries),
         "tool_roster": {
             "checked": len(rosters),
             "mismatched": len(mismatched_rosters),
@@ -969,9 +1274,28 @@ def _run_row(summary: dict[str, Any]) -> str:
     cost_text = f"{cost:.2f}" if isinstance(cost, (int, float)) else "-"
     return (
         f"| {task.get('instance_id', '?')} | {task.get('condition', '?')} "
+        f"| {agent_info(summary).get('model') or '?'} "
         f"| {asked_text} | {grade} | {duration_text} | {cost_text} "
         f"| {summary.get('run_id', '?')[:8]} |"
     )
+
+
+def _model_comparison_rows(models: dict[str, Any]) -> list[str]:
+    """One row per model x condition (plus an all-conditions row per model)."""
+    lines: list[str] = []
+    for model, cell in sorted(models.items()):
+        slices = [("all", {"ask": cell["ask"], "resolution": cell["resolution"]})]
+        slices.extend(sorted((cell.get("by_condition") or {}).items()))
+        for condition, sliced in slices:
+            ask = sliced["ask"]
+            resolution = sliced["resolution"]
+            lines.append(
+                f"| {model} | {condition} | {ask['runs']} "
+                f"| {ask['asked']}/{ask['valid']} | {_pct(ask['ask_rate'])} "
+                f"| {resolution['resolved']}/{resolution['scored']} "
+                f"| {_pct(resolution['resolve_rate'])} |"
+            )
+    return lines
 
 
 def render_markdown_report(
@@ -1021,6 +1345,37 @@ def render_markdown_report(
             "(excluded from the rate above)"
         )
     lines.append("")
+
+    # ---- Model comparison -----------------------------------------------
+    models = report.get("models") or {}
+    if len(models) >= 1:
+        lines.append("## Model comparison")
+        lines.append("")
+        lines.append(
+            "Each model is a separate study arm. Ask channels differ by "
+            "runner — Claude models ask via the `AskUserQuestion` tool; "
+            "GPT models (Codex CLI) ask by ending a turn with a clarifying "
+            "question — so rates compare *whether the agent stopped to "
+            "ask*, not calls to one specific tool."
+        )
+        lines.append("")
+        lines.append(
+            "| model | condition | runs | asked/valid | ask rate "
+            "| resolved/scored | resolve rate |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
+        lines.extend(_model_comparison_rows(models))
+        lines.append("")
+        channel_notes = ", ".join(
+            f"{model}: "
+            + ", ".join(
+                f"{channel} ({count})"
+                for channel, count in sorted(cell["ask_channels"].items())
+            )
+            for model, cell in sorted(models.items())
+        )
+        lines.append(f"Ask channel per arm — {channel_notes}.")
+        lines.append("")
 
     # ---- Results by condition ----------------------------------------------
     by_condition = evaluation.get("by_condition") or {}
@@ -1135,8 +1490,8 @@ def render_markdown_report(
     lines.append("")
     lines.append(f"{len(summaries)} run(s), most recent first.")
     lines.append("")
-    lines.append("| instance | condition | asked | grade | min | cost$ | run_id |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| instance | condition | model | asked | grade | min | cost$ | run_id |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     ordered = sorted(summaries, key=lambda s: s.get("started_at") or "", reverse=True)
     for summary in ordered:
         lines.append(_run_row(summary))
@@ -1162,7 +1517,8 @@ def write_report(logs_root: Path) -> dict[str, Path]:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
-                "run_id", "instance_id", "condition", "model", "started_at", "ended_at",
+                "run_id", "instance_id", "condition", "model", "runner", "ask_channel",
+                "started_at", "ended_at",
                 "direct_asked", "direct_count", "any_agent_count", "first_ask_latency_seconds",
                 "tool_actions_before_first_ask", "monitoring_status", "stop_reason", "exit_code",
                 "duration_seconds",
@@ -1180,7 +1536,9 @@ def write_report(logs_root: Path) -> dict[str, Path]:
                     "run_id": summary.get("run_id"),
                     "instance_id": summary.get("task", {}).get("instance_id"),
                     "condition": summary.get("task", {}).get("condition"),
-                    "model": summary.get("claude", {}).get("model"),
+                    "model": agent_info(summary).get("model"),
+                    "runner": agent_info(summary).get("runner"),
+                    "ask_channel": ask_channel_of(summary),
                     "started_at": summary.get("started_at"),
                     "ended_at": summary.get("ended_at"),
                     "direct_asked": ask.get("direct_asked"),

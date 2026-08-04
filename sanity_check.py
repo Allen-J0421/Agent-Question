@@ -70,6 +70,21 @@ def parse_time(value) -> datetime | None:
         return None
 
 
+def agent_of(record: dict) -> dict:
+    """Runner/model identity; multi-runner `agent` key, legacy `claude` fallback."""
+    agent = record.get("agent")
+    if isinstance(agent, dict):
+        return agent
+    legacy = record.get("claude")
+    if isinstance(legacy, dict):
+        return {**legacy, "runner": "claude-sdk"}
+    return {}
+
+
+def is_claude_run(record: dict) -> bool:
+    return str(agent_of(record).get("runner") or "claude-sdk").startswith("claude")
+
+
 # --------------------------------------------------------------------------
 # Per-run classification
 # --------------------------------------------------------------------------
@@ -83,10 +98,16 @@ def classify(summary: dict) -> str:
 
 
 def is_limit_shaped(summary: dict) -> bool:
-    """The usage-limit signature: errored with (almost) no work performed."""
+    """The usage-limit signature: errored with (almost) no work performed.
+
+    Claude-SDK-only: Codex runs never report a $ cost, so every dead Codex
+    run would match and the "one exhausted-limit event" diagnosis would fire
+    spuriously.
+    """
     process = summary.get("process", {})
     return bool(
-        classify(summary) == "dead"
+        is_claude_run(summary)
+        and classify(summary) == "dead"
         and (process.get("sdk_num_turns") or 0) <= 1
         and not process.get("sdk_total_cost_usd")
     )
@@ -256,7 +277,7 @@ def clean_dead(
         to_clean.append({
             "kind": "dead", "stem": rid, "instance_id": task.get("instance_id"),
             "condition": task.get("condition"),
-            "model": summary.get("claude", {}).get("model"),
+            "model": agent_of(summary).get("model"),
         })
     for mid, manifest in manifests.items():
         if mid in runs:
@@ -265,7 +286,7 @@ def clean_dead(
         to_clean.append({
             "kind": "interrupted", "stem": mid, "instance_id": task.get("instance_id"),
             "condition": task.get("condition"),
-            "model": manifest.get("claude", {}).get("model"),
+            "model": agent_of(manifest).get("model"),
         })
 
     if not to_clean:
@@ -317,7 +338,7 @@ def main() -> int:
     # ---- 1. Run table -----------------------------------------------------
     print(f"\nRUNS ({len(summaries)} shown, most recent first)")
     header = (
-        f"  {'started':16} {'instance':26} {'cond':9} {'turns':>5} "
+        f"  {'started':16} {'instance':26} {'cond':9} {'model':14} {'turns':>5} "
         f"{'min':>5} {'cost$':>6} {'asked':5} {'eval':14} verdict"
     )
     print(header)
@@ -336,12 +357,16 @@ def main() -> int:
             eval_text = f"scored:{'R' if grade.get('resolved') else 'unres'}"
         verdict = classify(summary)
         flag = OK if verdict == "clean" else BAD
+        # Claude reports assistant turns; Codex reports user rounds.
         turns = process.get("sdk_num_turns")
+        if turns is None:
+            turns = process.get("codex_rounds")
         cost = process.get("sdk_total_cost_usd")
         columns = [
             short(started.strftime("%m-%d %H:%M") if started else None, 16),
             short(task.get("instance_id"), 26),
             short(task.get("condition"), 9),
+            short(agent_of(summary).get("model"), 14),
             f"{turns if turns is not None else '-':>5}",
             f"{duration / 60:>5.1f}" if isinstance(duration, (int, float)) else f"{'-':>5}",
             f"{cost:>6.2f}" if isinstance(cost, (int, float)) else f"{'-':>6}",
@@ -371,11 +396,21 @@ def main() -> int:
             )
         for summary in dead:
             process = summary.get("process", {})
-            error = process.get("sdk_error") or process.get("stop_reason") or "no error text recorded"
+            error = (
+                process.get("sdk_error")
+                or process.get("codex_error")
+                or process.get("stop_reason")
+                or "no error text recorded"
+            )
+            subtype = (
+                process.get("sdk_result_subtype")
+                if is_claude_run(summary)
+                else process.get("stop_reason")
+            )
             print(
                 f"  {BAD} {summary.get('run_id', '?')[:8]}  "
                 f"{summary.get('task', {}).get('instance_id')}  "
-                f"[{process.get('sdk_result_subtype') or '-'}] {str(error)[:110]}"
+                f"[{subtype or '-'}] {str(error)[:110]}"
             )
 
     # Interrupted sessions: a manifest with no matching run summary.
@@ -391,34 +426,100 @@ def main() -> int:
             print(f"  {BAD} unreadable: {path}")
 
     # ---- 3. Measurement channel -------------------------------------------
+    # Each runner has its own ask channel, so its integrity checks differ:
+    # Claude-SDK runs must expose the AskUserQuestion tool and route
+    # permission prompts through the callback; Codex runs must have a
+    # resumable thread and their raw --json event streams on disk.
     print("\nCHANNEL (ask-measurement integrity)")
-    roster_bad = [
-        s for s in summaries
-        if s.get("tool_roster", {}).get("matches_reference") is False
-        or s.get("tool_roster", {}).get("askuserquestion_available") is False
-    ]
-    if roster_bad:
-        problems.append(f"{len(roster_bad)} run(s) with roster mismatch / AskUserQuestion missing")
-        for summary in roster_bad:
-            print(f"  {BAD} roster problem on {summary.get('run_id', '?')[:8]}")
-    else:
-        print(f"  {OK} tool roster matched reference on all runs; AskUserQuestion available")
+    claude_runs = [s for s in summaries if is_claude_run(s)]
+    codex_runs = [s for s in summaries if not is_claude_run(s)]
     clean = [s for s in summaries if classify(s) == "clean"]
-    no_prompts = [
-        s for s in clean if not s.get("permissions", {}).get("prompts_reaching_callback")
-    ]
-    if no_prompts:
-        problems.append(f"{len(no_prompts)} clean run(s) saw zero permission prompts")
-        for summary in no_prompts:
-            print(f"  {BAD} zero prompts reached callback: {summary.get('run_id', '?')[:8]}")
-    else:
-        print(f"  {OK} permission prompts reached the callback on every clean run")
-    asked_counts = {
-        "asked": sum(s.get("ask_user_question", {}).get("direct_asked") is True for s in summaries),
-        "did not ask": sum(s.get("ask_user_question", {}).get("direct_asked") is False for s in summaries),
-        "unobservable": sum(not isinstance(s.get("ask_user_question", {}).get("direct_asked"), bool) for s in summaries),
-    }
-    print("  ask outcomes: " + ", ".join(f"{v} {k}" for k, v in asked_counts.items()))
+
+    if claude_runs:
+        roster_bad = [
+            s for s in claude_runs
+            if s.get("tool_roster", {}).get("matches_reference") is False
+            or s.get("tool_roster", {}).get("askuserquestion_available") is False
+        ]
+        if roster_bad:
+            problems.append(f"{len(roster_bad)} run(s) with roster mismatch / AskUserQuestion missing")
+            for summary in roster_bad:
+                print(f"  {BAD} roster problem on {summary.get('run_id', '?')[:8]}")
+        else:
+            print(f"  {OK} claude: tool roster matched reference on all runs; AskUserQuestion available")
+        no_prompts = [
+            s for s in claude_runs
+            if classify(s) == "clean"
+            and not s.get("permissions", {}).get("prompts_reaching_callback")
+        ]
+        if no_prompts:
+            problems.append(f"{len(no_prompts)} clean claude run(s) saw zero permission prompts")
+            for summary in no_prompts:
+                print(f"  {BAD} zero prompts reached callback: {summary.get('run_id', '?')[:8]}")
+        else:
+            print(f"  {OK} claude: permission prompts reached the callback on every clean run")
+
+    if codex_runs:
+        no_thread = [
+            s for s in codex_runs
+            if classify(s) == "clean" and not s.get("process", {}).get("codex_thread_id")
+        ]
+        if no_thread:
+            problems.append(
+                f"{len(no_thread)} clean codex run(s) recorded no thread id — "
+                "asks could not have been answered"
+            )
+            for summary in no_thread:
+                print(f"  {BAD} no codex thread id: {summary.get('run_id', '?')[:8]}")
+        else:
+            print(f"  {OK} codex: every clean run has a resumable thread id")
+        no_events = [
+            s for s in codex_runs
+            if classify(s) == "clean"
+            and not any((logs / "sessions" / s.get("run_id", "?")).glob("codex-events-round-*.jsonl"))
+        ]
+        if no_events:
+            problems.append(
+                f"{len(no_events)} clean codex run(s) have no preserved --json "
+                "event stream — the ask classification cannot be re-derived"
+            )
+            for summary in no_events:
+                print(f"  {BAD} missing event stream: {summary.get('run_id', '?')[:8]}")
+        else:
+            print(f"  {OK} codex: raw event streams preserved for every clean run")
+        # The zero-edit ask gate rests on an empirical claim (36/36 harvested
+        # turns: asking and editing never co-occur). Any run that contradicts
+        # it deserves eyes before its ask outcome is trusted.
+        gate_hits = [
+            s for s in codex_runs
+            if s.get("ask_user_question", {}).get("questions_with_edits")
+        ]
+        if gate_hits:
+            problems.append(
+                f"{len(gate_hits)} codex run(s) had a question on an edited turn "
+                "(gated to not-asked) — review the zero-edit gate assumption"
+            )
+            for summary in gate_hits:
+                print(f"  {WARN} question on edited turn: {summary.get('run_id', '?')[:8]}")
+        else:
+            print(f"  {OK} codex: no questions co-occurred with edits (gate assumption holds)")
+
+    by_model_counts: dict[str, dict[str, int]] = {}
+    for summary in summaries:
+        model = agent_of(summary).get("model") or "?"
+        cell = by_model_counts.setdefault(model, {"asked": 0, "did not ask": 0, "unobservable": 0})
+        asked_value = summary.get("ask_user_question", {}).get("direct_asked")
+        if asked_value is True:
+            cell["asked"] += 1
+        elif asked_value is False:
+            cell["did not ask"] += 1
+        else:
+            cell["unobservable"] += 1
+    for model, cell in sorted(by_model_counts.items()):
+        print(
+            f"  ask outcomes [{model}]: "
+            + ", ".join(f"{count} {name}" for name, count in cell.items())
+        )
 
     # ---- 4. Grading --------------------------------------------------------
     print("\nGRADING")
@@ -449,7 +550,7 @@ def main() -> int:
     seen: dict[tuple, list[str]] = {}
     for summary in summaries:
         task = summary.get("task", {})
-        key = (task.get("instance_id"), task.get("condition"), summary.get("claude", {}).get("model"))
+        key = (task.get("instance_id"), task.get("condition"), agent_of(summary).get("model"))
         seen.setdefault(key, []).append(f"{summary.get('run_id', '?')[:8]}:{classify(summary)}")
     duplicates = {k: v for k, v in seen.items() if len(v) > 1}
     if duplicates:

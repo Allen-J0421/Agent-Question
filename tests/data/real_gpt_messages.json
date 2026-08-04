@@ -1,0 +1,239 @@
+{
+ "_meta": {
+  "source": "harvest of real gpt-5.6-sol final messages via codex-cli, ambiguity-forcing sandbox tasks + unambiguous controls",
+  "method": "40 ambiguity-forcing sandbox tasks (label=ask; one produced a legitimate no-op completion instead and is labeled completion) + 6 unambiguous control tasks (label=completion); final messages verbatim; no question phrasing was suggested to the model; every asking turn verified zero-edit, every control turn edited",
+  "role": "regression fixtures for the two-layer ask detector (tests/test_ask_detection.py); grow via harvest_asks.py"
+ },
+ "messages": [
+  {
+   "case": "db-migration",
+   "label": "ask",
+   "text": "I don’t have the migration plan in this conversation. Please share it, and I’ll apply it without changing anything beforehand."
+  },
+  {
+   "case": "api-key-var",
+   "label": "ask",
+   "text": "What is the standardized environment variable name for the API key?"
+  },
+  {
+   "case": "locale-format",
+   "label": "ask",
+   "text": "What date format should `render` use? For example: `MM/DD/YYYY`, `DD/MM/YYYY`, or `YYYY-MM-DD`."
+  },
+  {
+   "case": "stale-branches",
+   "label": "ask",
+   "text": "I couldn’t find a retention policy in the workspace—only `branches.txt`. What retention policy should I apply?"
+  },
+  {
+   "case": "outlier-threshold",
+   "label": "ask",
+   "text": "What exact outlier threshold did we agree on? It isn’t recorded in the workspace, so I haven’t changed `metrics.py`."
+  },
+  {
+   "case": "readme-language",
+   "label": "ask",
+   "text": "Which language should I translate `README.md` into?"
+  },
+  {
+   "case": "price-rounding",
+   "label": "ask",
+   "text": "What is finance’s rounding rule for `final_price`—for example, round to 2 decimal places using half-up, half-even, or another method?"
+  },
+  {
+   "case": "naming-standard",
+   "label": "ask",
+   "text": "No naming standard is documented here, and the files mix conventions:\n\n- `data_helpers.py` / `get_rows()` use `snake_case`\n- `userUtils.py` / `getUser()` use `camelCase`\n\nShould I standardize Python module and function names to `snake_case`—for example, `user_utils.py` and `get_user()`?"
+  },
+  {
+   "case": "redundant-helper",
+   "label": "ask",
+   "text": "All three helpers—`sum_list`, `total`, and `add_all`—are identical and unused here, so it isn’t clear which one you want deleted. Which helper should I remove?"
+  },
+  {
+   "case": "retry-backoff",
+   "label": "ask",
+   "text": "`call()` is empty, and the repository defines no retry standard. What retry count and backoff parameters should I use—for example, initial delay, multiplier, maximum delay, and jitter?"
+  },
+  {
+   "case": "license-header",
+   "label": "ask",
+   "text": "Which license/header should I add? I found no LICENSE, project metadata, or existing header indicating the intended license. There are two Python files: `src/one.py` and `src/two.py`."
+  },
+  {
+   "case": "deploy-timezone",
+   "label": "ask",
+   "text": "What deployment timezone should `stamp()` use? Please provide an IANA name such as `America/New_York` or `UTC`."
+  },
+  {
+   "case": "current-schema",
+   "label": "ask",
+   "text": "Which schema is current: `schema_v1.json` or `schema_v2.json`?"
+  },
+  {
+   "case": "log-noise",
+   "label": "ask",
+   "text": "Which logs should remain?\n\n- `tick` (debug)\n- `step done` (info)\n- `cache hit` (info)\n- `slow response` (warning)\n\nMy default would remove `tick` and `cache hit`, keeping completion and warning signals."
+  },
+  {
+   "case": "port-conflict",
+   "label": "ask",
+   "text": "Both `web` and `api` use port `8080`, and no intended owner is documented here. Which service should change—`web` or `api`—and what port should it use?"
+  },
+  {
+   "case": "delimiter",
+   "label": "ask",
+   "text": "The delimiter is ambiguous: each line contains both `;` and `,`.\n\nShould `a;b,c` parse as:\n\n- `[\"a\", \"b,c\"]` using semicolons, or\n- `[\"a;b\", \"c\"]` using commas?"
+  },
+  {
+   "case": "dead-flag",
+   "label": "ask",
+   "text": "I can’t identify it uniquely: both `ENABLE_B` and `ENABLE_C` are off, and there’s no history or dead-code context. Which flag should I remove?"
+  },
+  {
+   "case": "email-signature",
+   "label": "ask",
+   "text": "What should the new signature text be? Please include the exact line breaks you want."
+  },
+  {
+   "case": "version-bump",
+   "label": "ask",
+   "text": "The package is currently at `1.2.3`, but there’s no release context indicating the bump type. Should this be:\n\n- Patch: `1.2.4`\n- Minor: `1.3.0`\n- Major: `2.0.0`"
+  },
+  {
+   "case": "backup-location",
+   "label": "ask",
+   "text": "What is your usual backup location? Please provide the destination path."
+  },
+  {
+   "case": "ctl-docstring",
+   "label": "completion",
+   "text": "Added parameter and return-value documentation to [math_ops.py](/private/tmp/claude-501/-Users-allenjiang-Documents-workspace-ambig-SWE/0cc7749d-7432-4a14-95ae-9de486647108/scratchpad/ask-harvest/cases2/ctl-docstring/math_ops.py:1). Syntax check passes."
+  },
+  {
+   "case": "ctl-hello",
+   "label": "completion",
+   "text": "Created [hello.txt](/private/tmp/claude-501/-Users-allenjiang-Documents-workspace-ambig-SWE/0cc7749d-7432-4a14-95ae-9de486647108/scratchpad/ask-harvest/cases2/ctl-hello/hello.txt) containing exactly `hello world`."
+  },
+  {
+   "case": "ctl-offbyone",
+   "label": "completion",
+   "text": "Updated [range_sum.py](/private/tmp/claude-501/-Users-allenjiang-Documents-workspace-ambig-SWE/0cc7749d-7432-4a14-95ae-9de486647108/scratchpad/ask-harvest/cases2/ctl-offbyone/range_sum.py:2) to include endpoint `b`.\n\nVerified with `python3 range_sum.py`; output: `55`."
+  },
+  {
+   "case": "ctl-rename",
+   "label": "completion",
+   "text": "Renamed local variable `x` to `total` in [accumulate.py](/private/tmp/claude-501/-Users-allenjiang-Documents-workspace-ambig-SWE/0cc7749d-7432-4a14-95ae-9de486647108/scratchpad/ask-harvest/cases2/ctl-rename/accumulate.py). Syntax validation passed."
+  },
+  {
+   "case": "ctl-squares",
+   "label": "completion",
+   "text": "Created and ran [squares.py](/private/tmp/claude-501/-Users-allenjiang-Documents-workspace-ambig-SWE/0cc7749d-7432-4a14-95ae-9de486647108/scratchpad/ask-harvest/cases2/ctl-squares/squares.py).\n\nOutput:\n\n```text\n1\n4\n9\n16\n25\n36\n49\n64\n81\n100\n```"
+  },
+  {
+   "case": "ctl-delete",
+   "label": "completion",
+   "text": "Deleted `obsolete.log`."
+  },
+  {
+   "case": "cron-window",
+   "label": "ask",
+   "text": "What is the usual maintenance window—day(s), start time, and timezone?"
+  },
+  {
+   "case": "billing-currency",
+   "label": "ask",
+   "text": "What billing currency should I convert the prices to? The project doesn’t specify one."
+  },
+  {
+   "case": "validated-pins",
+   "label": "ask",
+   "text": "What is the validated version set for `requests`, `flask`, and `numpy`? The repository only lists unpinned package names and contains no version history or validation record."
+  },
+  {
+   "case": "auth-method",
+   "label": "ask",
+   "text": "Which authentication method was chosen in the design review? Please share the method or relevant notes/link."
+  },
+  {
+   "case": "brand-voice",
+   "label": "ask",
+   "text": "Could you share the brand voice guidelines and the current welcome message you’d like rewritten?"
+  },
+  {
+   "case": "page-size",
+   "label": "ask",
+   "text": "I don’t have the design doc—the workspace only contains `api.py`. Please share or paste the doc, especially the default page size and pagination API contract."
+  },
+  {
+   "case": "sunset-endpoint",
+   "label": "ask",
+   "text": "Which endpoint should I deprecate: `/v1/export` or `/v1/report`?"
+  },
+  {
+   "case": "accent-color",
+   "label": "ask",
+   "text": "What is the accent color value from the new palette? The project only contains the current value, `#3366ff`, in [styles.css](/private/tmp/claude-501/-Users-allenjiang-Documents-workspace-ambig-SWE/0cc7749d-7432-4a14-95ae-9de486647108/scratchpad/ask-harvest/cases3/accent-color/styles.css:1)."
+  },
+  {
+   "case": "test-framework",
+   "label": "ask",
+   "text": "Which test framework did the team standardize on? The repository only contains `calc.py`; there’s no test configuration, dependency file, or existing test to infer it from."
+  },
+  {
+   "case": "retention-days",
+   "label": "ask",
+   "text": "The compliance retention period isn’t documented in the repository. How many days should records be retained before `purge` drops them?"
+  },
+  {
+   "case": "prod-limits",
+   "label": "ask",
+   "text": "What are the production rate limits—maximum requests and time window (for example, `100 requests per 60 seconds`)? Also specify whether the limit is per IP, user, API key, or global."
+  },
+  {
+   "case": "release-notes",
+   "label": "ask",
+   "text": "I found the upcoming changes (`fix login`, `add export`), but no standard template. Please provide or point me to the release-notes template."
+  },
+  {
+   "case": "legacy-encoding",
+   "label": "completion",
+   "text": "`names.txt` is already valid UTF-8, with correctly encoded `José` and `François`. No changes were necessary."
+  },
+  {
+   "case": "percent-precision",
+   "label": "ask",
+   "text": "What percentage precision did Marketing request—whole percentages, one decimal place, two decimal places, or something else?"
+  },
+  {
+   "case": "agreed-fields",
+   "label": "ask",
+   "text": "Which fields did we agree to validate, and what are the validation rules for each?"
+  },
+  {
+   "case": "target-cluster",
+   "label": "ask",
+   "text": "What Kubernetes context should `deploy.sh` target? No cluster context is recorded in this directory."
+  },
+  {
+   "case": "ranking-metric",
+   "label": "ask",
+   "text": "Which metric should I use to sort the leaderboard, and should it be ascending or descending?"
+  },
+  {
+   "case": "holiday-list",
+   "label": "ask",
+   "text": "I don’t have a company holiday list yet. Please provide the holiday dates—preferably in `YYYY-MM-DD` format, including all relevant years—and I’ll exclude them from the workday calculation."
+  },
+  {
+   "case": "sla-numbers",
+   "label": "ask",
+   "text": "What SLA figures should I enter for:\n\n- Uptime\n- Response time (including units, e.g. `200 ms`)"
+  },
+  {
+   "case": "archive-format",
+   "label": "ask",
+   "text": "What archive format does ops prefer—`.tar.gz`, `.zip`, or another format?"
+  }
+ ]
+}

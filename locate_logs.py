@@ -74,6 +74,15 @@ def grade_label(logs: Path, run_id: str, summary: dict) -> str:
     return status
 
 
+def agent_of(record: dict) -> dict:
+    """Runner/model identity; multi-runner `agent` key, legacy `claude` fallback."""
+    agent = record.get("agent")
+    if isinstance(agent, dict):
+        return agent
+    legacy = record.get("claude")
+    return {**legacy, "runner": "claude-sdk"} if isinstance(legacy, dict) else {}
+
+
 def describe(summary: dict, logs: Path) -> dict:
     run_id = summary.get("run_id", "?")
     task = summary.get("task", {})
@@ -82,11 +91,14 @@ def describe(summary: dict, logs: Path) -> dict:
         "run_id": run_id,
         "instance_id": task.get("instance_id"),
         "condition": task.get("condition"),
-        "model": summary.get("claude", {}).get("model"),
+        "model": agent_of(summary).get("model"),
+        "runner": agent_of(summary).get("runner"),
         "started_at": summary.get("started_at"),
         "clean": summary.get("session", {}).get("ran_meaningfully") is not False,
         "asked": summary.get("ask_user_question", {}).get("direct_asked"),
-        "sdk_session_id": process.get("sdk_session_id"),
+        # Claude SDK sessions and Codex threads are both "the harness's own
+        # id for this session"; whichever the runner recorded is shown.
+        "session_id": process.get("sdk_session_id") or process.get("codex_thread_id"),
         "grade": grade_label(logs, run_id, summary),
         "artifacts": artifact_map(logs, run_id),
     }
@@ -121,7 +133,9 @@ def main() -> int:
         print(f"{len(summaries)} run(s) across {len(by_instance)} instance(s):")
         for iid, runs in sorted(by_instance.items()):
             conditions = ", ".join(
-                f"{s.get('task', {}).get('condition')}:{s.get('run_id', '?')[:8]}" for s in runs
+                f"{s.get('task', {}).get('condition')}"
+                f"[{agent_of(s).get('model') or '?'}]:{s.get('run_id', '?')[:8]}"
+                for s in runs
             )
             print(f"  {iid:30s} {conditions}")
         return 0
@@ -154,9 +168,10 @@ def main() -> int:
         for entry in entries:
             print(
                 f"  [{entry['condition']}] {entry['run_id']}\n"
-                f"      model={entry['model']}  started={entry['started_at']}  "
+                f"      model={entry['model']}  runner={entry['runner']}  "
+                f"started={entry['started_at']}  "
                 f"clean={entry['clean']}  asked={entry['asked']}  grade={entry['grade']}\n"
-                f"      sdk_session_id={entry['sdk_session_id']}"
+                f"      session_id={entry['session_id']}"
             )
             for name, info in entry["artifacts"].items():
                 if not info["exists"]:

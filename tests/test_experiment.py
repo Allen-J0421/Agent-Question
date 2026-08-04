@@ -1,11 +1,16 @@
 from pathlib import Path
 
+import pytest
+
 from experiment import (
     CHECKOUTS,
     CONDITION_FIELD,
+    RUNNER_CLAUDE,
+    RUNNER_CODEX,
     build_prompt,
     load_rows,
     requested_conditions,
+    runner_for_model,
     select_batch_rows,
     issue_text,
     workspace_path,
@@ -149,3 +154,48 @@ def test_dead_runs_do_not_block_a_retry(tmp_path):
     write("launch", "three", True, stop_reason="launch_error")
 
     assert completed_run_keys(tmp_path) == {("one", "ambiguous", "model")}
+
+
+def test_one_model_switch_routes_to_the_right_runner():
+    # A single --model flag selects the study arm; the runner follows from
+    # the model name, so no separate runner flag can drift out of sync.
+    assert runner_for_model("claude-opus-4-8") == RUNNER_CLAUDE
+    assert runner_for_model("claude-sonnet-5") == RUNNER_CLAUDE
+    assert runner_for_model("gpt-5.6-sol") == RUNNER_CODEX
+    assert runner_for_model("gpt-5.6-terra") == RUNNER_CODEX
+    assert runner_for_model("codex-mini") == RUNNER_CODEX
+    with pytest.raises(SystemExit):
+        runner_for_model("gemini-3")
+
+
+def test_resume_state_is_keyed_per_model_across_both_record_generations(tmp_path):
+    # The same instance+condition must stay runnable for a *different* model,
+    # and legacy summaries (claude key) must count for their own model just
+    # like multi-runner summaries (agent key).
+    import json
+
+    from experiment import completed_run_keys
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    legacy = {
+        "run_id": "legacy",
+        "task": {"instance_id": "one", "condition": "ambiguous"},
+        "claude": {"model": "claude-opus-4-8", "interface": "sdk"},
+        "process": {"stop_reason": "end_turn"},
+        "session": {"ran_meaningfully": True},
+    }
+    codex = {
+        "run_id": "codex",
+        "task": {"instance_id": "one", "condition": "ambiguous"},
+        "agent": {"model": "gpt-5.6-sol", "runner": "codex-cli"},
+        "process": {"stop_reason": "completed"},
+        "session": {"ran_meaningfully": True},
+    }
+    (runs / "legacy.json").write_text(json.dumps(legacy))
+    (runs / "codex.json").write_text(json.dumps(codex))
+
+    assert completed_run_keys(tmp_path) == {
+        ("one", "ambiguous", "claude-opus-4-8"),
+        ("one", "ambiguous", "gpt-5.6-sol"),
+    }

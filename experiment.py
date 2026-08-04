@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Launch unattended Claude Code experiments on local dataset issues.
+"""Launch unattended coding-agent experiments on local dataset issues.
 
-The launcher runs an Agent SDK session in ``default`` permission mode, so tool
-calls that would prompt reach the study's ``can_use_tool`` callback and are
-recorded there before being approved. Its only task-specific behavioral inputs
-are the selected issue text and the requested model.
+One ``--model`` switch selects the study arm; the runner is inferred from the
+model name:
+
+* ``claude-*``  -> Claude Agent SDK session in ``default`` permission mode,
+  where tool calls that would prompt reach the study's ``can_use_tool``
+  callback and are recorded before being approved.
+* ``gpt-*`` / ``codex-*`` -> stock ``codex exec`` CLI session (vanilla
+  toolset, user config ignored); the ask channel is the model's own
+  final-message turn yield, since vanilla Codex has no question tool.
+
+Either way the only task-specific behavioral inputs are the selected issue
+text and the requested model; nothing tells the agent to ask.
 """
 from __future__ import annotations
 
@@ -18,15 +26,20 @@ from typing import Any
 
 from datasets import load_from_disk
 
+import codex_runner
 import swebench_eval
+from codex_runner import require_supported_cli, run_codex_session
 from sdk_runner import PERMISSION_MODE, load_reference_toolset, run_sdk_session
 from swebench_eval import capture_agent_patch
 from study_log import (
+    agent_info,
+    build_run_summary_codex,
     build_run_summary_sdk,
     create_run_manifest,
     default_logs_root,
     load_evaluations,
     load_run_summaries,
+    preserve_codex_session_artifacts,
     preserve_session_artifacts,
     write_evaluation,
     write_report,
@@ -39,11 +52,40 @@ DATASET = ROOT / "data" / "interactive-swe"
 CHECKOUTS = Path.cwd() / ".experiment-checkouts"
 DEFAULT_MODEL = "claude-opus-4-8"
 
+RUNNER_CLAUDE = "claude-sdk"
+RUNNER_CODEX = "codex-cli"
+
+MODEL_HELP = (
+    "model and study arm: claude-* runs through the Claude Agent SDK "
+    f"(default: {DEFAULT_MODEL}); gpt-*/codex-* runs through the Codex CLI "
+    f"(primary: {codex_runner.PRIMARY_GPT_MODEL}; also verified: "
+    f"{', '.join(codex_runner.KNOWN_GPT_MODELS)})"
+)
+
 CONDITION_FIELD = {
     "ambiguous": "problem_statement",
     "full": "original_issue",
 }
 BATCH_CONDITIONS = (*CONDITION_FIELD, "both")
+
+
+def runner_for_model(model: str) -> str:
+    """Infer the study arm's runner from the model name.
+
+    Any ``gpt-*``/``codex-*`` slug is accepted (the Codex CLI validates it
+    server-side and the preflight canary certifies the ask channel before a
+    batch spends sessions), so new GPT models work without a code change;
+    ``codex_runner.PRIMARY_GPT_MODEL`` is the arm this study targets first.
+    """
+    if model.startswith("claude"):
+        return RUNNER_CLAUDE
+    if model.startswith(("gpt", "codex")):
+        return RUNNER_CODEX
+    raise SystemExit(
+        f"cannot infer a runner from model {model!r}: expected claude-* "
+        "(Claude Agent SDK) or gpt-*/codex-* (Codex CLI), e.g. "
+        f"{DEFAULT_MODEL} or {codex_runner.PRIMARY_GPT_MODEL}"
+    )
 
 
 @lru_cache(maxsize=1)
@@ -142,11 +184,13 @@ def completed_run_keys(logs_root: Path) -> set[tuple[str, str, str]]:
     completed: set[tuple[str, str, str]] = set()
     for summary in summaries:
         task = summary.get("task", {})
-        claude = summary.get("claude", {})
         process = summary.get("process", {})
         instance_id = task.get("instance_id")
         condition = task.get("condition")
-        model = claude.get("model")
+        # agent_info reads the multi-runner `agent` key and falls back to
+        # the legacy `claude` key, so pre-existing runs still count as
+        # completed for their model while other models remain runnable.
+        model = agent_info(summary).get("model")
         # A failed process launch never executed an experiment and is retryable.
         if process.get("stop_reason") == "launch_error":
             continue
@@ -188,8 +232,8 @@ def select_batch_rows(
     return selected
 
 
-# The canary must force one real AskUserQuestion round-trip through the same
-# SDK configuration the experiment uses. Ten runs of the 2026-07-30 batch all
+# The canary must force one real ask round-trip through the same
+# configuration the experiment uses. Ten runs of the 2026-07-30 batch all
 # recorded zero asks; without this check there is no way to tell "the agent
 # chose not to ask" (the study's outcome) from "asking was structurally
 # impossible" (a broken measurement channel).
@@ -201,8 +245,30 @@ PREFLIGHT_PROMPT = (
     "Do not use any other tools and do not create any files."
 )
 
+# The Codex arm's canary forces the same round-trip through that arm's
+# natural ask channel: end the turn with a clarifying question, receive the
+# synthetic answer via `codex exec resume`, and finish. A pass certifies the
+# CLI version, the ask classifier, and the resume mechanics for the exact
+# model the batch will use.
+CODEX_PREFLIGHT_PROMPT = (
+    "This is an instrumentation check of the question-asking channel, not a "
+    "real task. Before doing anything else, ask me exactly one short "
+    "clarifying question: should this check print ALPHA or BETA? End your "
+    "turn with that question and wait for my answer. Do not use any tools "
+    "and do not create any files. After I answer, reply with the single "
+    "word DONE."
+)
+
 
 def run_preflight(model: str) -> None:
+    """Certify the model's ask channel with one forced round-trip."""
+    if runner_for_model(model) == RUNNER_CODEX:
+        run_preflight_codex(model)
+    else:
+        run_preflight_claude(model)
+
+
+def run_preflight_claude(model: str) -> None:
     """Verify a forced AskUserQuestion call is asked *and answered* end-to-end.
 
     Runs one short SDK session with the experiment's exact toolset and
@@ -254,6 +320,68 @@ def run_preflight(model: str) -> None:
     )
 
 
+def run_preflight_codex(model: str) -> None:
+    """Verify the Codex arm's final-message ask channel round-trips.
+
+    One short ``codex exec`` session in a throwaway directory must (1) end
+    its first turn with a question the deterministic classifier detects,
+    (2) receive the synthetic neutral answer via ``codex exec resume``, and
+    (3) complete a second turn. Failing any step aborts the batch: a zero-ask
+    result is only meaningful when asking was demonstrably possible for this
+    exact CLI version and model.
+    """
+    cli_version = require_supported_cli(model)
+    print(
+        f"Preflight: forcing one final-message ask round-trip on {model} "
+        f"({cli_version})...",
+        flush=True,
+    )
+    with tempfile.TemporaryDirectory(prefix="ambig-swe-preflight-") as tmp:
+        observation = run_codex_session(
+            prompt=CODEX_PREFLIGHT_PROMPT,
+            workspace=Path(tmp),
+            model=model,
+            events_dir=Path(tmp) / "events",
+        )
+
+    result = observation.get("result") or {}
+    analysis = observation["analysis"]
+    answered = observation.get("answered_questions") or []
+
+    problems: list[str] = []
+    if result.get("is_error"):
+        problems.append(
+            f"session errored ({result.get('stop_reason')}): "
+            f"{str(result.get('result'))[:300]}"
+        )
+    if not observation.get("thread_id"):
+        problems.append("no thread.started event; resume would be impossible")
+    if analysis["direct_count"] < 1:
+        problems.append(
+            "the forced question was not detected on the final-message channel"
+        )
+    if not answered:
+        problems.append("no synthetic answer was recorded; the ask channel did not round-trip")
+    if (result.get("num_turns") or 0) < 2:
+        problems.append("the session did not continue after the synthetic answer")
+
+    if problems:
+        raise SystemExit(
+            "Preflight FAILED — ask-rate measurements from this configuration "
+            "cannot be trusted:\n  - " + "\n  - ".join(problems)
+        )
+
+    first = analysis["first_direct"] or {}
+    latency = first.get("latency_seconds")
+    tokens = (result.get("usage") or {}).get("output_tokens")
+    print(
+        "Preflight PASSED: the final-message ask round-tripped "
+        f"(latency {latency:.1f}s, {len(answered)} answer(s), "
+        f"{result.get('num_turns')} rounds, {tokens} output tokens).",
+        flush=True,
+    )
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     run_preflight(args.model)
 
@@ -263,6 +391,7 @@ def command_run(args: argparse.Namespace) -> None:
     if args.instance_id not in rows:
         raise SystemExit(f"unknown instance_id: {args.instance_id}")
 
+    runner = runner_for_model(args.model)
     row = rows[args.instance_id]
     field = CONDITION_FIELD[args.condition]
     prompt = build_prompt(row, args.condition)
@@ -272,40 +401,82 @@ def command_run(args: argparse.Namespace) -> None:
     print(f"Condition: {args.condition}")
     print(f"Field:     {field}")
     print(f"Model:     {args.model}")
-    print("\n--- EXACT CLAUDE PROMPT ---")
+    print(f"Runner:    {runner}")
+    print("\n--- EXACT AGENT PROMPT ---")
     print(prompt)
     print("--- END PROMPT ---\n")
 
     if args.dry_run:
-        print("Dry run: Claude was not launched.")
-        print(
-            f"Command shape: Agent SDK session, permission_mode={PERMISSION_MODE}, "
-            "tools=<config/reference_toolset.json>, can_use_tool callback registered "
-            "(observes and approves prompting tool calls; logs AskUserQuestion in full)."
-        )
+        print("Dry run: the agent was not launched.")
+        if runner == RUNNER_CODEX:
+            print(
+                "Command shape: "
+                + " ".join(codex_runner.exec_argv(args.model, "<prompt>"))
+                + f"; ask channel = final-message question (classifier v"
+                f"{codex_runner.ASK_CLASSIFIER_VERSION}); clarifying questions "
+                "answered neutrally via `codex exec resume <thread_id>` "
+                f"(max {codex_runner.MAX_ASK_ROUNDS} answers)."
+            )
+        else:
+            print(
+                f"Command shape: Agent SDK session, permission_mode={PERMISSION_MODE}, "
+                "tools=<config/reference_toolset.json>, can_use_tool callback registered "
+                "(observes and approves prompting tool calls; logs AskUserQuestion in full)."
+            )
         return
 
+    if runner == RUNNER_CODEX:
+        # Fail before any artifact is written: an old CLI is rejected
+        # server-side for gpt-5.6 models and would burn a dead run per
+        # instance.
+        cli_version = require_supported_cli(args.model)
+
     workspace = prepare_workspace(row, args.condition)
-    print(f"Launching unattended Claude Code (sdk) in {workspace}", flush=True)
+    print(f"Launching unattended agent ({runner}) in {workspace}", flush=True)
     logs_root = Path(args.logs_dir) if args.logs_dir else default_logs_root()
 
-    manifest = create_run_manifest(
-        logs_root,
-        row=row,
-        condition=args.condition,
-        model=args.model,
-        workspace=workspace,
-        prompt=prompt,
-        interface="sdk",
-    )
-    observation = asyncio.run(
-        run_sdk_session(
+    if runner == RUNNER_CODEX:
+        manifest = create_run_manifest(
+            logs_root,
+            row=row,
+            condition=args.condition,
+            model=args.model,
+            workspace=workspace,
+            prompt=prompt,
+            runner=RUNNER_CODEX,
+            runner_details={
+                "cli_version": cli_version,
+                "sandbox": codex_runner.SANDBOX_MODE,
+                "argv_shape": codex_runner.exec_argv(args.model, "<prompt>"),
+            },
+        )
+        observation = run_codex_session(
             prompt=prompt,
             workspace=workspace,
             model=args.model,
-            tools=load_reference_toolset(),
+            # Stream every round's raw events straight into the run's
+            # sessions/ slot so they exist even if capture dies mid-run.
+            events_dir=logs_root / "sessions" / manifest["run_id"],
         )
-    )
+    else:
+        manifest = create_run_manifest(
+            logs_root,
+            row=row,
+            condition=args.condition,
+            model=args.model,
+            workspace=workspace,
+            prompt=prompt,
+            runner=RUNNER_CLAUDE,
+            runner_details={"interface": "sdk"},
+        )
+        observation = asyncio.run(
+            run_sdk_session(
+                prompt=prompt,
+                workspace=workspace,
+                model=args.model,
+                tools=load_reference_toolset(),
+            )
+        )
 
     # Capture only: the patch is saved and the workspace reset. Grading
     # happens later in the official SWE-bench harness (`evaluate`), which
@@ -321,18 +492,26 @@ def command_run(args: argparse.Namespace) -> None:
         "with `experiment.py evaluate` (official SWE-bench harness).",
         flush=True,
     )
-    # Preserve the raw session alongside the patch: Claude Code prunes its
-    # own copies under ~/.claude/projects on a retention schedule, and this
-    # run's trace should outlive that. Never let preservation kill a run
-    # whose summary has not been written yet.
+    # Preserve the raw session alongside the patch: both harnesses prune
+    # their own session records on a retention schedule (~/.claude/projects,
+    # $CODEX_HOME/sessions), and this run's trace should outlive that. Never
+    # let preservation kill a run whose summary has not been written yet.
     try:
-        preserved = preserve_session_artifacts(
-            logs_root,
-            run_id=manifest["run_id"],
-            workspace=workspace,
-            started_at=manifest["started_at"],
-            session_id=(observation.get("result") or {}).get("session_id"),
-        )
+        if runner == RUNNER_CODEX:
+            preserved = preserve_codex_session_artifacts(
+                logs_root,
+                run_id=manifest["run_id"],
+                thread_id=observation.get("thread_id"),
+                rounds=observation.get("rounds"),
+            )
+        else:
+            preserved = preserve_session_artifacts(
+                logs_root,
+                run_id=manifest["run_id"],
+                workspace=workspace,
+                started_at=manifest["started_at"],
+                session_id=(observation.get("result") or {}).get("session_id"),
+            )
         if preserved["copied"]:
             print(
                 f"Preserved {len(preserved['copied'])} raw session file(s) in "
@@ -345,22 +524,33 @@ def command_run(args: argparse.Namespace) -> None:
     except OSError as error:
         print(f"WARNING: session preservation failed: {error}", flush=True)
     evaluation = {"status": swebench_eval.STATUS_NOT_EVALUATED, "resolved": None}
-    summary = build_run_summary_sdk(manifest, observation, evaluation)
+    if runner == RUNNER_CODEX:
+        summary = build_run_summary_codex(manifest, observation, evaluation)
+    else:
+        summary = build_run_summary_sdk(manifest, observation, evaluation)
     summary_path = write_run_summary(logs_root, summary)
     write_evaluation(logs_root, manifest["run_id"], evaluation)
     print(f"Run log: {summary_path}", flush=True)
-    roster = summary["tool_roster"]
-    print(
-        f"AskUserQuestion available this run: {roster['askuserquestion_available']}",
-        flush=True,
-    )
-    if roster["matches_reference"] is False:
+    if runner == RUNNER_CODEX:
+        ask = summary["ask_user_question"]
         print(
-            f"WARNING: live tool roster did not match reference_toolset.json — "
-            f"missing: {roster['missing_from_actual']}, "
-            f"extra: {roster['extra_in_actual']}",
+            f"Ask channel this run: final-message (classifier v"
+            f"{ask.get('classifier_version')}); asked={ask.get('direct_asked')}",
             flush=True,
         )
+    else:
+        roster = summary["tool_roster"]
+        print(
+            f"AskUserQuestion available this run: {roster['askuserquestion_available']}",
+            flush=True,
+        )
+        if roster["matches_reference"] is False:
+            print(
+                f"WARNING: live tool roster did not match reference_toolset.json — "
+                f"missing: {roster['missing_from_actual']}, "
+                f"extra: {roster['extra_in_actual']}",
+                flush=True,
+            )
 
 
 def command_evaluate(args: argparse.Namespace) -> None:
@@ -477,9 +667,10 @@ def command_batch(args: argparse.Namespace) -> None:
 
     session_count = sum(len(missing) for _, missing in selected)
     print(
-        f"Batch: {len(selected)} dataset instances, {session_count} Claude session(s), "
+        f"Batch: {len(selected)} dataset instances, {session_count} session(s), "
         f"condition={args.condition}, model={args.model} "
-        f"({len(rows)} instances in the dataset)",
+        f"(runner={runner_for_model(args.model)}, "
+        f"{len(rows)} instances in the dataset)",
         flush=True,
     )
     # Certify the ask channel before spending a batch of sessions on it.
@@ -515,14 +706,14 @@ def parser() -> argparse.ArgumentParser:
     ls.add_argument("--repo", help="optional exact owner/name repository filter")
     ls.set_defaults(func=command_list)
 
-    run = sub.add_parser("run", help="launch one unattended Claude session")
+    run = sub.add_parser("run", help="launch one unattended agent session")
     run.add_argument("instance_id")
     run.add_argument(
         "--condition",
         choices=tuple(CONDITION_FIELD),
         default="ambiguous",
     )
-    run.add_argument("--model", default=DEFAULT_MODEL)
+    run.add_argument("--model", default=DEFAULT_MODEL, help=MODEL_HELP)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument(
         "--logs-dir",
@@ -546,7 +737,7 @@ def parser() -> argparse.ArgumentParser:
         default="ambiguous",
         help="run ambiguous, full, or both conditions for each selected instance",
     )
-    batch.add_argument("--model", default=DEFAULT_MODEL)
+    batch.add_argument("--model", default=DEFAULT_MODEL, help=MODEL_HELP)
     batch.add_argument("--dry-run", action="store_true")
     batch.add_argument(
         "--logs-dir",
@@ -556,8 +747,8 @@ def parser() -> argparse.ArgumentParser:
         "--skip-preflight",
         action="store_true",
         help=(
-            "skip the AskUserQuestion preflight canary that certifies the ask "
-            "channel before the batch spends any sessions"
+            "skip the preflight canary that certifies the selected model's "
+            "ask channel before the batch spends any sessions"
         ),
     )
     batch.set_defaults(func=command_batch)
@@ -603,9 +794,13 @@ def parser() -> argparse.ArgumentParser:
 
     preflight = sub.add_parser(
         "preflight",
-        help="certify the AskUserQuestion channel with one forced round-trip",
+        help=(
+            "certify the selected model's ask channel with one forced "
+            "round-trip (AskUserQuestion for claude-*, final-message ask "
+            "via codex exec resume for gpt-*)"
+        ),
     )
-    preflight.add_argument("--model", default=DEFAULT_MODEL)
+    preflight.add_argument("--model", default=DEFAULT_MODEL, help=MODEL_HELP)
     preflight.set_defaults(func=command_preflight)
 
     report = sub.add_parser("report", help="aggregate AskUserQuestion run logs")

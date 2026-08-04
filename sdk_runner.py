@@ -24,13 +24,20 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-from claude_agent_sdk.types import PermissionResultAllow
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 
 ROOT = Path(__file__).resolve().parent
 REFERENCE_TOOLSET_PATH = ROOT / "config" / "reference_toolset.json"
 
 PERMISSION_MODE = "default"
+
+# Up to three synthetic first-option answers per run; the same cap applies
+# to the Codex arm (codex_runner.MAX_ASK_ROUNDS), so neither arm can
+# out-ask the other by harness construction. An ask beyond the cap is still
+# recorded (direct_count keeps counting) but ends the session -- mirroring
+# the Codex arm, where an unanswered ask is a turn yield with no resume.
+MAX_ASK_ROUNDS = 3
 
 
 def load_reference_toolset() -> list[str]:
@@ -60,6 +67,7 @@ async def run_sdk_session(
     model: str,
     tools: list[str] | None = None,
     stop_on_first_ask: bool = False,
+    max_ask_rounds: int = MAX_ASK_ROUNDS,
 ) -> dict[str, Any]:
     """Run one headless SDK session and return a structured observation.
 
@@ -93,10 +101,11 @@ async def run_sdk_session(
     answered_questions: list[dict[str, Any]] = []
     result_message: dict[str, Any] | None = None
     stopped_on_first_ask = False
+    hit_ask_cap = False
 
     async def can_use_tool(tool_name, input_data, context):
         nonlocal main_tool_actions, first_direct, direct_count
-        nonlocal any_agent_count, permission_prompts
+        nonlocal any_agent_count, permission_prompts, hit_ask_cap
 
         is_subagent = context.agent_id is not None
         is_ask = tool_name == "AskUserQuestion"
@@ -120,6 +129,19 @@ async def run_sdk_session(
                             "assistant_tool_actions_before": main_tool_actions,
                             "permission_prompts_before": permission_prompts,
                         }
+            # Symmetric with the Codex arm: only max_ask_rounds asks are
+            # answered per run. A further ask is recorded above (the counts
+            # keep counting) but ends the session instead of being answered,
+            # exactly like an unanswered Codex turn yield.
+            if len(answered_questions) >= max_ask_rounds:
+                hit_ask_cap = True
+                return PermissionResultDeny(
+                    message=(
+                        f"this run's synthetic-answer limit ({max_ask_rounds}) "
+                        "is reached; the session ends here"
+                    ),
+                    interrupt=True,
+                )
             questions = input_data.get("questions") or []
             answers = _first_option_answers(questions)
             # Every synthetic answer is recorded, not just the first, so the
@@ -194,6 +216,8 @@ async def run_sdk_session(
         "started_at": started_at.isoformat(),
         "ended_at": ended_at.isoformat(),
         "stopped_on_first_ask": stopped_on_first_ask,
+        "max_ask_rounds": max_ask_rounds,
+        "hit_ask_cap": hit_ask_cap,
         "permission_prompts": permission_prompts,
         "answered_questions": answered_questions,
         "analysis": {
