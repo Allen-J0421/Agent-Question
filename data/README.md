@@ -1,167 +1,245 @@
-# `interactive-swe` Dataset
+# Two datasets
 
-A benchmark for studying **ambiguity handling and clarification behavior in software-engineering agents**. It is a modified derivative of **SWE-bench Verified** (the same 500 human-validated instances across 12 Python repositories), augmented so that each task can be presented to an agent in an *under-specified* form while the full ground-truth context is retained for evaluation.
+This directory contains two separate datasets, both derived from the same 500-task
+[SWE-bench Verified](https://www.swebench.com/) source benchmark. They serve different research
+purposes and have different formats.
 
-The core idea: the normal, detail-rich GitHub issue is preserved verbatim in `original_issue`, while `problem_statement` holds a **short, paraphrased, deliberately vague summary** with all reproduction code, error strings, and expected/actual output removed. This lets you measure whether an agent recognizes missing information and asks clarifying questions — the "interactive" setting — versus how it performs given the complete spec.
+| Dataset | Location and format | Use it for |
+|---|---|---|
+| **1. Interactive SWE** | `interactive-swe/` — 15-column Hugging Face/Arrow dataset | Running software-agent experiments and evaluating patches under ambiguous versus full issue text. |
+| **2. Missing Information** | `missing-info/data.xlsx` — 28-column Excel dataset | Measuring whether an agent identifies and asks for deliberately hidden categories of issue information. |
 
----
+The datasets share task provenance, but neither should be treated as a replacement for the other:
+Interactive SWE is the runnable benchmark input; Missing Information is the richer annotation and
+clarification-analysis dataset.
 
-## At a glance
-
-| | |
-|---|---|
-| **Format** | HuggingFace `datasets`, saved to disk (Apache Arrow IPC) |
-| **Splits** | `test` only |
-| **Examples** | 500 |
-| **Columns** | 15 (all `string`) |
-| **On-disk size** | ~8 MB (`data-00000-of-00001.arrow`) |
-| **Repositories** | 12 (Python OSS projects) |
-| **Issue date range** | 2013-01-25 → 2023-08-07 |
-| **Base benchmark** | SWE-bench Verified |
-| **`instance_id`** | Unique for all 500; format `repo__name-<number>` |
-
-### Directory layout
+## Layout
 
 ```
 data/
-├── README.md                        ← this file
-└── interactive-swe/
-    ├── dataset_dict.json            ← {"splits": ["test"]}
-    └── test/
-        ├── data-00000-of-00001.arrow   ← the 500 records
-        ├── dataset_info.json           ← HF feature schema + stats
-        └── state.json                  ← HF split state / fingerprint
+├── README.md
+├── interactive-swe/                  # Runnable 15-column Hugging Face dataset
+│   ├── dataset_dict.json
+│   └── test/
+│       ├── data-00000-of-00001.arrow # 500 records
+│       ├── dataset_info.json
+│       └── state.json
+└── missing-info/
+    └── data.xlsx                      # 28-column annotation and baseline workbook
 ```
 
 ---
 
-## Schema
+## Dataset 1 — `interactive-swe/`
 
-All 15 fields are stored as strings. Fields marked **★** are additions/modifications relative to standard SWE-bench; the rest are inherited unchanged.
+`interactive-swe` is the dataset consumed by the experiment scripts. It presents every task in two
+forms:
 
-### Task specification
+- **Ambiguous condition:** `problem_statement`, a short rewrite that removes reproductions,
+  tracebacks/error text, and expected-versus-actual behavior.
+- **Full-information condition:** `original_issue`, the real GitHub issue text.
 
-| Column | Description |
+This makes it possible to compare whether a software agent asks for clarification and whether the
+missing context changes its ability to produce a correct patch.
+
+### Dataset facts
+
+| Property | Value |
 |---|---|
-| `problem_statement` **★** | **Rewritten, ambiguous task description.** Short prose summary of the issue (avg **377** chars, max 810). Reproduction code, tracebacks, and expected/actual output are **stripped** — 0/500 contain any code block or REPL snippet. Shorter than `original_issue` in 489/500 cases. This is the intended agent-facing prompt for the ambiguous condition. |
-| `original_issue` **★** | **The real GitHub issue text**, verbatim (avg **1,700** chars, max 24,770). 256/500 contain a code repro or traceback. Use as the "full-information" control condition or as the ground-truth source of the details missing from `problem_statement`. |
-| `hints_text` | Maintainer/discussion comments from the issue thread. **Empty for 162/500** instances. |
+| Format | Hugging Face `datasets`, saved to disk as Apache Arrow IPC |
+| Split | `test` only |
+| Rows | 500 |
+| Columns | 15, all stored as strings |
+| Source | SWE-bench Verified, across 12 Python repositories |
+| Prompt size | `problem_statement`: average 377 chars; `original_issue`: average 1,700 chars |
 
-### Ground truth / solution
+### Fields
 
-| Column | Description |
-|---|---|
-| `patch` | Gold code diff that fixes the issue (unified diff, avg 1.6 KB). Touches **1 file in 429/500** instances; the rest touch 2–6 (one outlier: 21). |
-| `test_patch` | Diff adding/modifying tests that validate the fix (avg 1.8 KB). |
-| `files` **★** | Gold file path(s) the fix edits (comma/newline-separated string, e.g. `astropy/modeling/separable.py`). Convenient localization ground truth. **Empty for 26/500** instances — see Caveats. |
-| `FAIL_TO_PASS` | JSON-encoded list of test node IDs that must flip **fail → pass** after the fix (avg 3.0 tests, up to 438). Primary success oracle. |
-| `PASS_TO_PASS` | JSON-encoded list of regression tests that must **stay passing** (avg 120 tests, up to 2,476). |
+| Group | Fields | Purpose |
+|---|---|---|
+| Agent-facing issue text | `problem_statement`, `original_issue` | Use one of these as the task prompt, depending on the experimental condition. |
+| Issue discussion | `hints_text` | Maintainer comments. Empty in 162 rows and generally hidden to prevent leakage. |
+| Solution and test oracles | `patch`, `test_patch`, `FAIL_TO_PASS`, `PASS_TO_PASS` | Evaluate a proposed patch. `FAIL_TO_PASS` must pass after the fix; `PASS_TO_PASS` must remain passing. |
+| File-localization oracle | `files` | Gold source paths edited by the fix. Empty in 26 rows. |
+| Checkout and provenance | `repo`, `instance_id`, `base_commit`, `environment_setup_commit`, `version`, `created_at`, `difficulty` | Reproduce the task environment and stratify results. |
 
-### Environment / provenance
+`base_commit` is the unresolved code revision. `patch` and `test_patch` are answer keys, not prompt
+context. `FAIL_TO_PASS` and `PASS_TO_PASS` are JSON-encoded test lists and must be parsed before use.
 
-| Column | Description |
-|---|---|
-| `repo` | GitHub `owner/name` of the source repository. |
-| `instance_id` | Unique task ID, `repo__name-<issue/PR number>` (e.g. `astropy__astropy-12907`). |
-| `base_commit` | 40-char SHA the agent should start from (issue is unresolved at this commit). |
-| `environment_setup_commit` | 40-char SHA pinning the dependency/build environment. |
-| `version` | Project release line the instance targets (e.g. `4.3`, `3.2`). |
-| `created_at` | ISO-8601 timestamp of the original issue. |
-| `difficulty` | Human effort estimate: `<15 min fix`, `15 min - 1 hour`, `1-4 hours`, `>4 hours`. |
+### Load it
 
----
-
-## Distributions
-
-### Repositories (× difficulty)
-
-| repo | <15 min | 15 min–1 hr | 1–4 hr | >4 hr | **total** |
-|---|--:|--:|--:|--:|--:|
-| django/django | 92 | 117 | 22 | 0 | **231** |
-| sympy/sympy | 25 | 43 | 6 | 1 | **75** |
-| sphinx-doc/sphinx | 22 | 17 | 4 | 1 | **44** |
-| matplotlib/matplotlib | 15 | 19 | 0 | 0 | **34** |
-| scikit-learn/scikit-learn | 13 | 18 | 1 | 0 | **32** |
-| astropy/astropy | 4 | 15 | 3 | 0 | **22** |
-| pydata/xarray | 5 | 15 | 1 | 1 | **22** |
-| pytest-dev/pytest | 8 | 8 | 3 | 0 | **19** |
-| pylint-dev/pylint | 3 | 5 | 2 | 0 | **10** |
-| psf/requests | 6 | 2 | 0 | 0 | **8** |
-| mwaskom/seaborn | 0 | 2 | 0 | 0 | **2** |
-| pallets/flask | 1 | 0 | 0 | 0 | **1** |
-| **total** | **194** | **261** | **42** | **3** | **500** |
-
-> ⚠️ **Django dominates (~46%)** and difficulty skews easy/medium (91% ≤ 1 hour). Control for repository and difficulty when reporting aggregate results.
-
----
-
-## Loading
-
-**With `datasets` (recommended):**
 ```python
 from datasets import load_from_disk
 
 ds = load_from_disk("data/interactive-swe")["test"]
-print(ds)                     # 500 rows, 15 columns
-ex = ds[0]
-print(ex["problem_statement"])   # ambiguous prompt
-print(ex["original_issue"])      # full issue
+example = ds[0]
+
+ambiguous_prompt = example["problem_statement"]
+full_prompt = example["original_issue"]
 ```
 
-**With `pyarrow` only (no `datasets` install):**
+With only PyArrow:
+
 ```python
-import pyarrow as pa, pyarrow.ipc as ipc
+import pyarrow as pa
+import pyarrow.ipc as ipc
 
-with pa.memory_map("data/interactive-swe/test/data-00000-of-00001.arrow", "r") as src:
+path = "data/interactive-swe/test/data-00000-of-00001.arrow"
+with pa.memory_map(path, "r") as src:
     table = ipc.open_stream(src).read_all()
-df = table.to_pandas()
 ```
 
-**Parsing the test lists** (`FAIL_TO_PASS` / `PASS_TO_PASS` are JSON strings):
+### Use it
+
+1. Check out `repo` at `base_commit`.
+2. Give the agent `problem_statement` for the ambiguous condition or `original_issue` for the
+   full-information control.
+3. Record whether it asks a question before it edits, then capture its patch.
+4. Evaluate the patch with the SWE-bench test oracles.
+
+### Important caveats
+
+- Django accounts for about 46% of rows, and 91% of tasks are estimated at one hour or less. Report
+  repository- and difficulty-stratified results when possible.
+- `problem_statement` is a rewrite, not a verbatim issue title.
+- `files` is missing in 26 rows; derive paths from `patch` diff headers when needed.
+- `hints_text` is missing in 162 rows and can leak withheld details when present.
+
+---
+
+## Dataset 2 — `missing-info/data.xlsx`
+
+This 500-row, 28-column companion workbook explains what was hidden from each issue and supports
+direct evaluation of clarification questions. It is analysis data, not the file used directly by the
+experiment harness.
+
+### How one row is constructed
+
+```text
+complete original issue
+  → annotate evidence across six information categories
+  → identify the categories present in this issue
+  → independently create three natural-sounding masked rewrites
+  → store what was hidden as labels and detailed answer keys
+  → collect baseline model questions for rewrite_3
+```
+
+The six categories are:
+
+- Error Information
+- Reproduction Steps
+- Expected Behavior
+- Version/Environment Information
+- External References
+- Implementation Details
+
+### The three rewrite variants
+
+For each variant `k` (`1`, `2`, or `3`), the pipeline normally selects **one to three** present
+categories, removes their annotated evidence, and rewrites the remaining issue so it has no obvious
+redaction gap.
+
+The variants are independent samples, **not a partition**: a category can be hidden in more than one
+variant. The entire hidden-category set happens to match in only 3–4 of the 500 rows, but that does
+not mean categories are disjoint. The project uses variant 3; variants 1 and 2 are extra experimental
+capacity.
+
+| Field family | What it contains | Who may use it |
+|---|---|---|
+| `rewrite_1` / `_2` / `_3` | Natural-sounding, incomplete issue prompt | Agent and evaluator |
+| `hidden_categories_1` / `_2` / `_3` | Comma-separated category labels for information withheld from the matching rewrite | Evaluator only |
+| `hidden_info_1` / `_2` / `_3` | Detailed removed evidence, encoded as `Category: <probe question> \| Examples: <spans>` | Evaluator only |
+
+`problem_statement` is a verbatim copy of `rewrite_3` in all 496 populated rows. Existing
+`clarification_questions_*_3` columns were generated against rewrite 3, so score them only against
+the matching `_3` answer key.
+
+### Workbook schema
+
+| Columns | Role | Fields |
+|---|---|---|
+| 0–12 | SWE-bench task provenance and solution oracles | `repo`, `instance_id`, `base_commit`, `patch`, `test_patch`, `original issue`, `hints_text`, `created_at`, `version`, `FAIL_TO_PASS`, `PASS_TO_PASS`, `environment_setup_commit`, `difficulty` |
+| 13–14 | Source annotation for masking | `category_mapping`, `present_categories` |
+| 15–23 | Three masked prompts and their answer keys | `rewrite_1`–`rewrite_3`, `hidden_categories_1`–`hidden_categories_3`, `hidden_info_1`–`hidden_info_3` |
+| 24–26 | Existing baseline questions for variant 3 | `clarification_questions_grpo_3`, `clarification_questions_gpt5_nano_3`, `clarification_questions_gpt5_3` |
+| 27 | Harness alias | `problem_statement` |
+
+Key fields:
+
+| Field | Meaning and use |
+|---|---|
+| `category_mapping` | JSON source annotation: each category has `present` and verbatim `examples` spans. It is the source for the masking process. Four rows are empty objects. |
+| `present_categories` | Compact comma-separated view of categories marked present. It is the intended candidate pool for masking. |
+| `hidden_categories_k` | Compact scoring label: did the agent ask for the right *kind* of information? |
+| `hidden_info_k` | Detailed answer key: could the agent’s question recover a specific fact that was removed? |
+| `clarification_questions_*_3` | Pre-existing GRPO, GPT-5 nano, and GPT-5 baseline outputs. Use only for comparison, never as input to a new agent. |
+
+### Recommended evaluation protocol
+
+For a direct gap-identification test:
+
+1. Use `rewrite_3` as the only issue text.
+2. Ask the model to list clarification questions before proposing a solution.
+3. Map each question to one or more of the six categories.
+4. Compare the predicted categories with `hidden_categories_3` for category recall and coverage.
+5. Inspect `hidden_info_3` to judge whether a question requests a specific withheld fact.
+
+For a natural-behavior test, instead say only “Resolve this issue” and record whether the agent
+spontaneously asks before editing. Keep this separate from the forced question-generation test.
+
+The workbook’s existing baseline outputs have approximate category-level results:
+
+| Model | Questions/row | Hidden-category recall | Full coverage | Questions about visible information |
+|---|---:|---:|---:|---:|
+| GRPO | 2.94 | 27.6% | 12.6% | 37.2% |
+| GPT-5 nano | 5.26 | 53.6% | 32.1% | 47.4% |
+| GPT-5 | 5.07 | 56.7% | 35.2% | 46.8% |
+
+These scores come from a keyword classifier, not a semantic judge, and should be treated as
+comparative baselines rather than exact quality measurements.
+
+### Load it
+
 ```python
 import json
-f2p = json.loads(ex["FAIL_TO_PASS"])   # -> ["path::test_a", "path::test_b", ...]
+import pandas as pd
+
+df = pd.read_excel("data/missing-info/data.xlsx")
+df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+df["version"] = df["version"].astype(str)
+
+def split_categories(value):
+    if pd.isna(value):
+        return set()
+    return {item.strip() for item in str(value).split(",") if item.strip()}
+
+df["hidden_cats_3"] = df["hidden_categories_3"].apply(split_categories)
+evaluation_rows = df[df["hidden_cats_3"].apply(len) > 0]
+
+def parse_tests(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
 ```
 
----
+### Workbook caveats
 
-## Example record (`astropy__astropy-12907`)
-
-**`problem_statement`** (ambiguous, agent-facing):
-> The issue involves the incorrect computation of the separability matrix for nested compound models in a modeling library. While the separability matrix is computed correctly for simple and non-nested compound models, the expected separability is not maintained when models are nested, leading to unexpected results...
-
-**`original_issue`** (full, with repro — truncated):
-> `separability_matrix` does not compute separability correctly for nested CompoundModels
-> ```python
-> from astropy.modeling import models as m
-> cm = m.Linear1D(10) & m.Linear1D(5)
-> separability_matrix(m.Pix2Sky_TAN() & cm)
-> # -> off-diagonal True where it should be False
-> ```
-
-**Ground truth:** `files = astropy/modeling/separable.py` · `patch` edits `_cstack` · `FAIL_TO_PASS` = 2 tests in `test_separable.py`.
-
----
-
-## Suggested usage
-
-- **Ambiguous vs. full condition** — prompt agents with `problem_statement` (vague) and compare against `original_issue` (complete) to isolate the cost of missing information.
-- **Clarification behavior** — in the interactive setting, treat `original_issue` (and `hints_text`) as the "oracle" an agent can query, and measure whether a clarifying question recovers the detail needed to solve the task.
-- **Localization** — `files` provides a cheap, run-free ground truth for file-level retrieval accuracy.
-- **Resolution** — apply the agent's patch at `base_commit`, run the `test_patch`, and check that all `FAIL_TO_PASS` pass and all `PASS_TO_PASS` still pass (standard SWE-bench evaluation harnesses apply directly).
-
----
-
-## Caveats
-
-- **26 instances have an empty `files` field** even though their `patch` edits files (annotation gap). Derive file paths from the `patch` diff headers as a fallback.
-- **162 instances have empty `hints_text`** — don't assume hints are always available.
-- **Repository & difficulty imbalance** (Django ~46%; 91% of tasks ≤ 1 hour) — stratify or reweight for fair aggregate reporting.
-- `problem_statement` is a machine/human paraphrase, not the literal issue title; do not treat it as verbatim source text.
-- All columns are typed `string`, including the JSON-encoded `FAIL_TO_PASS` / `PASS_TO_PASS` and the multi-valued `files` — parse before use.
-
----
+- **Excel truncation:** `PASS_TO_PASS` is invalid/truncated in 26 rows because Excel cells reached
+  their 32,767-character limit.
+- **Incomplete annotations:** four rows have no downstream annotation. Another 17 have empty
+  `hidden_categories_3`; exclude both groups from category-recall evaluation, leaving 479 usable
+  variant-3 rows.
+- **Implementation Details label bug:** `hidden_categories_k` under-reports this category. In 174
+  variant-3 rows, the corresponding `hidden_info_3` segment has an empty category name; only 36 of
+  those rows name it in `hidden_categories_3`. Recover this category from `hidden_info_k` before
+  reporting metrics that involve it.
+- **Correlated variants:** do not put variants of the same `instance_id` into different training and
+  test splits.
 
 ## Provenance
 
-Derived from **SWE-bench Verified** (Jimenez et al., *SWE-bench: Can Language Models Resolve Real-World GitHub Issues?*), which itself samples human-validated instances from 12 popular Python repositories. The `original_issue`, `problem_statement` (rewritten), and `files` fields were added/modified for the ambiguity/interactive study in this project (`ambig-SWE`). All standard SWE-bench evaluation fields are preserved.
+Both datasets are derived from SWE-bench Verified (Jimenez et al., *SWE-bench: Can Language Models
+Resolve Real-World GitHub Issues?*). `interactive-swe` adds the ambiguous `problem_statement`,
+full `original_issue`, and `files` fields. The workbook adds the information-category annotations,
+rewrite variants, and clarification-question baselines.
