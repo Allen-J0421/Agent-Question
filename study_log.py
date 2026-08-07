@@ -66,6 +66,32 @@ def agent_info(record: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+# Conditions that identify their dataset on records written before the
+# `dataset` field existed. Kept in sync with `experiment.CONDITION_FIELD`.
+_DATASET_BY_CONDITION = {
+    "ambiguous": "interactive-swe",
+    "full": "interactive-swe",
+    "mi_ambiguous": "missing-info",
+    "mi_full": "missing-info",
+}
+
+
+def dataset_of(summary: dict[str, Any]) -> str | None:
+    """Return the issue source a manifest or run summary came from.
+
+    The two datasets cover the same 500 ``instance_id``s, so reports must key
+    on this to avoid conflating them. Records written before the second
+    dataset existed carry no ``dataset`` key; their condition names identify
+    the original dataset unambiguously, the same way ``agent_info`` keeps
+    pre-multi-runner records readable.
+    """
+    task = summary.get("task", {})
+    recorded = task.get("dataset")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    return _DATASET_BY_CONDITION.get(task.get("condition"))
+
+
 def ask_channel_of(summary: dict[str, Any]) -> str | None:
     """The channel a run's ask outcome was observed on.
 
@@ -95,6 +121,7 @@ def create_run_manifest(
     model: str,
     workspace: Path,
     prompt: str,
+    dataset: str = "interactive-swe",
     runner: str = "claude-sdk",
     runner_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -111,6 +138,11 @@ def create_run_manifest(
     silently conflated in analysis. Records written before the multi-runner
     change carry the same identity under a ``claude`` key; ``agent_info``
     reads both.
+
+    ``dataset`` names the issue source. The two datasets cover the same 500
+    ``instance_id``s, so without it a report cannot tell their runs apart;
+    records written before the second dataset existed omit the key and are
+    read through ``experiment.dataset_of``.
     """
     run_id = str(uuid.uuid4())
     manifest = {
@@ -122,6 +154,7 @@ def create_run_manifest(
             "repo": row["repo"],
             "base_commit": row["base_commit"],
             "difficulty": row.get("difficulty"),
+            "dataset": dataset,
             "condition": condition,
             "prompt_sha256": prompt_hash(prompt),
         },
@@ -1517,7 +1550,7 @@ def write_report(logs_root: Path) -> dict[str, Path]:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
-                "run_id", "instance_id", "condition", "model", "runner", "ask_channel",
+                "run_id", "instance_id", "dataset", "condition", "model", "runner", "ask_channel",
                 "started_at", "ended_at",
                 "direct_asked", "direct_count", "any_agent_count", "first_ask_latency_seconds",
                 "tool_actions_before_first_ask", "monitoring_status", "stop_reason", "exit_code",
@@ -1535,6 +1568,7 @@ def write_report(logs_root: Path) -> dict[str, Path]:
                 {
                     "run_id": summary.get("run_id"),
                     "instance_id": summary.get("task", {}).get("instance_id"),
+                    "dataset": dataset_of(summary),
                     "condition": summary.get("task", {}).get("condition"),
                     "model": agent_info(summary).get("model"),
                     "runner": agent_info(summary).get("runner"),

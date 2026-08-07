@@ -110,8 +110,11 @@ with pa.memory_map(path, "r") as src:
 ## Dataset 2 — `missing-info/data.xlsx`
 
 This 500-row, 28-column companion workbook explains what was hidden from each issue and supports
-direct evaluation of clarification questions. It is analysis data, not the file used directly by the
-experiment harness.
+direct evaluation of clarification questions.
+
+The harness runs it directly via `--dataset missing-info`, which pairs the conditions
+`mi_ambiguous` (`rewrite_3`) and `mi_full` (`original issue`). See
+[Running it through the harness](#running-it-through-the-harness) below.
 
 ### How one row is constructed
 
@@ -222,6 +225,40 @@ def parse_tests(value):
     except json.JSONDecodeError:
         return None
 ```
+
+### Running it through the harness
+
+`datasets_registry.py` normalizes both datasets onto one row schema, so the rest of the harness is
+dataset-agnostic:
+
+```bash
+python experiment.py list  --dataset missing-info
+python experiment.py run   <instance_id> --dataset missing-info --condition mi_ambiguous --dry-run
+python experiment.py batch --dataset missing-info --condition mi_ambiguous --count 50
+```
+
+The conditions are named `mi_*` rather than reusing `ambiguous`/`full` because both datasets cover
+the same 500 `instance_id`s; distinct names keep resume state, checkout directories, and every
+aggregate report from conflating the two. Runs record their source in `task.dataset`, which also
+appears as a `dataset` column in `reports/run-summary.csv`.
+
+Three normalizations happen at load time:
+
+- `original issue` is renamed to `original_issue` so one condition table serves both datasets.
+- The 26 truncated `PASS_TO_PASS` cells and the Excel-mangled `version` floats are repaired from
+  `interactive-swe`, which covers the same instances and agrees byte for byte on every shared
+  oracle column. Without the first repair those instances would be graded against an empty
+  regression suite and reported as resolved.
+- Every evaluator-only column is **stripped from the row entirely** — `hidden_categories_*`,
+  `hidden_info_*`, `category_mapping`, `present_categories`, the `clarification_questions_*`
+  baselines, the unused `rewrite_1`/`rewrite_2`, and `hints_text`. They are reachable only through
+  `datasets_registry.load_answer_keys()`, which nothing in the run path imports. The agent-facing
+  prompt is unchanged from the other dataset: `"Resolve the following issue in this repository:"`
+  followed by exactly one issue field.
+
+Note that four instances have no `rewrite_3` and are skipped under `mi_ambiguous`, leaving **496
+runnable**; a further 13 have no `hidden_categories_3`, leaving **483 scoreable** for category
+recall.
 
 ### Workbook caveats
 

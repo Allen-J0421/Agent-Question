@@ -1,15 +1,19 @@
+import json
 from pathlib import Path
 
 import pytest
 
+import datasets_registry
 from experiment import (
     CHECKOUTS,
     CONDITION_FIELD,
     RUNNER_CLAUDE,
     RUNNER_CODEX,
     build_prompt,
+    dataset_of,
     load_rows,
     requested_conditions,
+    resolve_conditions,
     runner_for_model,
     select_batch_rows,
     issue_text,
@@ -26,14 +30,32 @@ ROW = {
     "original_issue": "FULL TEXT",
 }
 
+# One sentinel per evaluator-only column, so a leak names the guilty field.
+ANSWER_KEY_SENTINELS = {
+    field: f"SENTINEL_{field.upper()}"
+    for field in datasets_registry.ANSWER_KEY_FIELDS
+}
+
+MISSING_INFO_ROW = {
+    **ROW,
+    "rewrite_3": "MASKED TEXT",
+    **ANSWER_KEY_SENTINELS,
+}
+
 
 def test_condition_mapping_is_explicit():
+    # Every condition names exactly one issue field, so no condition can widen
+    # what the agent sees. mi_* read the missing-info workbook.
     assert CONDITION_FIELD == {
         "ambiguous": "problem_statement",
         "full": "original_issue",
+        "mi_ambiguous": "rewrite_3",
+        "mi_full": "original_issue",
     }
     assert issue_text(ROW, "ambiguous") == "AMBIGUOUS TEXT"
     assert issue_text(ROW, "full") == "FULL TEXT"
+    assert issue_text(MISSING_INFO_ROW, "mi_ambiguous") == "MASKED TEXT"
+    assert issue_text(MISSING_INFO_ROW, "mi_full") == "FULL TEXT"
 
 
 def test_prompt_contains_only_selected_issue_text():
@@ -43,6 +65,47 @@ def test_prompt_contains_only_selected_issue_text():
     assert "FULL TEXT" not in ambiguous
     assert "FULL TEXT" in full
     assert "AMBIGUOUS TEXT" not in full
+
+
+def test_prompt_never_carries_the_missing_info_answer_key():
+    # The workbook ships the answer key to the exact question this study asks:
+    # which categories of information were hidden from the prompt. A prompt
+    # that carried any of it would invalidate the ask measurement.
+    for condition in ("mi_ambiguous", "mi_full"):
+        prompt = build_prompt(MISSING_INFO_ROW, condition)
+        for field, sentinel in ANSWER_KEY_SENTINELS.items():
+            assert sentinel not in prompt, f"{field} leaked into the {condition} prompt"
+
+
+def test_loaded_rows_do_not_carry_evaluator_only_fields():
+    # Defense in depth: the answer keys are stripped at load time, so they are
+    # not merely unused by the prompt -- they are absent from the row.
+    for dataset in datasets_registry.DATASETS:
+        rows = load_rows(dataset)
+        present = {key for row in rows.values() for key in row}
+        assert not (present & datasets_registry.ANSWER_KEY_FIELDS)
+
+
+def test_conditions_are_rejected_for_the_wrong_dataset():
+    # Both datasets share all 500 instance_ids, so a mismatched condition would
+    # silently record a run under the wrong name instead of failing.
+    with pytest.raises(SystemExit):
+        resolve_conditions("missing-info", ("ambiguous",))
+    with pytest.raises(SystemExit):
+        resolve_conditions("interactive-swe", ("mi_ambiguous",))
+    assert resolve_conditions("missing-info", ("mi_ambiguous",)) == ("mi_ambiguous",)
+
+
+def test_batch_both_expands_within_the_selected_dataset():
+    assert requested_conditions("both", "interactive-swe") == ("ambiguous", "full")
+    assert requested_conditions("both", "missing-info") == ("mi_ambiguous", "mi_full")
+
+
+def test_dataset_of_reads_runs_written_before_the_field_existed():
+    assert dataset_of({"task": {"dataset": "missing-info"}}) == "missing-info"
+    # Legacy runs carry no `dataset`; their condition identifies the source.
+    assert dataset_of({"task": {"condition": "ambiguous"}}) == "interactive-swe"
+    assert dataset_of({"task": {"condition": "mi_ambiguous"}}) == "missing-info"
 
 
 def test_session_does_not_bypass_permission_prompts():
@@ -110,6 +173,44 @@ def test_batch_both_runs_only_the_missing_condition_for_resumed_instances():
 
 def test_the_real_dataset_has_500_instances():
     assert len(load_rows()) == 500
+
+
+def test_both_datasets_cover_the_same_500_instances():
+    assert set(load_rows("interactive-swe")) == set(load_rows("missing-info"))
+
+
+def test_missing_info_test_lists_are_valid_json():
+    # 26 PASS_TO_PASS cells hit Excel's 32,767-character limit and are
+    # truncated to invalid JSON. swebench_eval.parse_node_ids swallows that
+    # and returns [], which would grade those instances against an empty
+    # regression suite and report them resolved. They are repaired from the
+    # Arrow dataset at load time; this guards the repair.
+    for instance_id, row in load_rows("missing-info").items():
+        for field in ("FAIL_TO_PASS", "PASS_TO_PASS"):
+            value = json.loads(row[field])
+            assert isinstance(value, list), f"{instance_id}: {field} is not a list"
+
+
+def test_missing_info_ambiguous_text_is_a_distinct_stimulus():
+    # rewrite_3 is an independent masked rewrite, not a copy of the
+    # interactive-swe ambiguous text. If these ever coincide the two datasets
+    # would be measuring the same prompt under different condition names.
+    interactive = load_rows("interactive-swe")
+    overlap = [
+        instance_id
+        for instance_id, row in load_rows("missing-info").items()
+        if (row.get("rewrite_3") or "").strip()
+        and (row.get("rewrite_3") or "").strip()
+        == (interactive[instance_id].get("problem_statement") or "").strip()
+    ]
+    assert not overlap
+
+
+def test_missing_info_runnable_instance_count():
+    # Four instances are unannotated and have no ambiguous rewrite to present.
+    rows = load_rows("missing-info")
+    runnable = [row for row in rows.values() if (row.get("rewrite_3") or "").strip()]
+    assert len(runnable) == 496
 
 
 def test_sessions_run_to_completion_so_asking_runs_are_still_gradable():

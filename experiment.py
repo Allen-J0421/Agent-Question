@@ -20,19 +20,18 @@ import argparse
 import asyncio
 import subprocess
 import tempfile
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from datasets import load_from_disk
-
 import codex_runner
+import datasets_registry
 import swebench_eval
 from codex_runner import require_supported_cli, run_codex_session
 from sdk_runner import PERMISSION_MODE, load_reference_toolset, run_sdk_session
 from swebench_eval import capture_agent_patch
 from study_log import (
     agent_info,
+    dataset_of as study_log_dataset_of,
     build_run_summary_codex,
     build_run_summary_sdk,
     create_run_manifest,
@@ -48,7 +47,8 @@ from study_log import (
 
 
 ROOT = Path(__file__).resolve().parent
-DATASET = ROOT / "data" / "interactive-swe"
+DEFAULT_DATASET = datasets_registry.DEFAULT_DATASET
+DATASETS = datasets_registry.DATASETS
 CHECKOUTS = Path.cwd() / ".experiment-checkouts"
 DEFAULT_MODEL = "claude-opus-4-8"
 
@@ -62,9 +62,28 @@ MODEL_HELP = (
     f"{', '.join(codex_runner.KNOWN_GPT_MODELS)})"
 )
 
+DATASET_HELP = (
+    f"issue source (default: {DEFAULT_DATASET}); 'interactive-swe' pairs "
+    "ambiguous/full, 'missing-info' pairs mi_ambiguous/mi_full, whose "
+    "ambiguous text hides annotated categories of information"
+)
+
+CONDITION_HELP = (
+    "ambiguous/full read the interactive-swe dataset; mi_ambiguous/mi_full "
+    "read the missing-info workbook"
+)
+
+# Each condition names exactly one issue field, so a condition can never
+# widen what the agent sees. The `mi_*` conditions belong to the
+# missing-info workbook, whose ambiguous text was produced by masking
+# annotated categories of information; they are named distinctly because both
+# datasets cover the same 500 instance_ids, and identical condition names
+# would conflate their runs in resume state and every aggregate report.
 CONDITION_FIELD = {
     "ambiguous": "problem_statement",
     "full": "original_issue",
+    "mi_ambiguous": "rewrite_3",
+    "mi_full": "original_issue",
 }
 BATCH_CONDITIONS = (*CONDITION_FIELD, "both")
 
@@ -88,10 +107,30 @@ def runner_for_model(model: str) -> str:
     )
 
 
-@lru_cache(maxsize=1)
-def load_rows() -> dict[str, dict[str, Any]]:
-    split = load_from_disk(str(DATASET))["test"]
-    return {split[i]["instance_id"]: dict(split[i]) for i in range(len(split))}
+def load_rows(dataset: str = DEFAULT_DATASET) -> dict[str, dict[str, Any]]:
+    """Return ``{instance_id: row}`` with evaluator-only fields already removed.
+
+    ``datasets_registry`` normalizes both datasets onto one schema and strips
+    the masking answer keys, so nothing here can route them into a prompt.
+    """
+    return datasets_registry.load_dataset_rows(dataset)
+
+
+def resolve_conditions(dataset: str, conditions: tuple[str, ...]) -> tuple[str, ...]:
+    """Reject conditions whose issue field the requested dataset does not have.
+
+    Without this, ``--dataset missing-info --condition ambiguous`` would read a
+    ``problem_statement`` that exists in the workbook but is a duplicate of
+    ``rewrite_3``, quietly recording the run under the wrong condition name.
+    """
+    valid = datasets_registry.conditions_for(dataset)
+    invalid = [condition for condition in conditions if condition not in valid]
+    if invalid:
+        raise SystemExit(
+            f"condition {', '.join(invalid)} is not available for dataset "
+            f"{dataset}; use {' or '.join(valid)}"
+        )
+    return conditions
 
 
 def issue_text(row: dict[str, Any], condition: str) -> str:
@@ -163,23 +202,45 @@ def prepare_workspace(row: dict[str, Any], condition: str) -> Path:
 
 
 def command_list(args: argparse.Namespace) -> None:
-    rows = list(load_rows().values())
+    rows = list(load_rows(args.dataset).values())
     if args.repo:
         rows = [row for row in rows if row["repo"] == args.repo]
-    print(f"# {len(rows)} instance(s)", flush=True)
+    print(f"# {len(rows)} instance(s) in {args.dataset}", flush=True)
     for row in rows[: args.limit]:
         print(f"{row['instance_id']}\t{row['repo']}\t{row['difficulty']}")
 
 
-def requested_conditions(condition: str) -> tuple[str, ...]:
-    """Expand the batch-only ``both`` option into individual experiment conditions."""
+def requested_conditions(condition: str, dataset: str = DEFAULT_DATASET) -> tuple[str, ...]:
+    """Expand the batch-only ``both`` option into individual experiment conditions.
+
+    ``both`` means both conditions *of the selected dataset*, never the full
+    four-entry table.
+    """
     if condition == "both":
-        return tuple(CONDITION_FIELD)
+        return datasets_registry.conditions_for(dataset)
     return (condition,)
 
 
+def dataset_of(summary: dict[str, Any]) -> str:
+    """Return the dataset a stored run was launched from, for grading.
+
+    ``study_log.dataset_of`` does the record reading (including the fallback
+    for runs written before the field existed); this narrows the result to a
+    dataset the harness can actually load.
+    """
+    recorded = study_log_dataset_of(summary)
+    if recorded in DATASETS:
+        return recorded
+    return DEFAULT_DATASET
+
+
 def completed_run_keys(logs_root: Path) -> set[tuple[str, str, str]]:
-    """Return completed (instance, condition, model) runs from immutable summaries."""
+    """Return completed (instance, condition, model) runs from immutable summaries.
+
+    The key stays ``(instance, condition, model)`` across both datasets because
+    the ``mi_*`` condition names are distinct, so a missing-info run never
+    marks the matching interactive-swe run complete.
+    """
     summaries, _ = load_run_summaries(logs_root)
     completed: set[tuple[str, str, str]] = set()
     for summary in summaries:
@@ -387,7 +448,8 @@ def command_preflight(args: argparse.Namespace) -> None:
 
 
 def command_run(args: argparse.Namespace) -> None:
-    rows = load_rows()
+    resolve_conditions(args.dataset, (args.condition,))
+    rows = load_rows(args.dataset)
     if args.instance_id not in rows:
         raise SystemExit(f"unknown instance_id: {args.instance_id}")
 
@@ -398,6 +460,7 @@ def command_run(args: argparse.Namespace) -> None:
 
     print(f"Instance:  {row['instance_id']}")
     print(f"Repository:{row['repo']}")
+    print(f"Dataset:   {args.dataset}")
     print(f"Condition: {args.condition}")
     print(f"Field:     {field}")
     print(f"Model:     {args.model}")
@@ -439,6 +502,7 @@ def command_run(args: argparse.Namespace) -> None:
         manifest = create_run_manifest(
             logs_root,
             row=row,
+            dataset=args.dataset,
             condition=args.condition,
             model=args.model,
             workspace=workspace,
@@ -462,6 +526,7 @@ def command_run(args: argparse.Namespace) -> None:
         manifest = create_run_manifest(
             logs_root,
             row=row,
+            dataset=args.dataset,
             condition=args.condition,
             model=args.model,
             workspace=workspace,
@@ -568,7 +633,16 @@ def command_evaluate(args: argparse.Namespace) -> None:
     if not summaries:
         raise SystemExit(f"no run summaries found under {logs_root}")
 
-    rows = load_rows()
+    # Runs from both datasets land in one log directory and share
+    # instance_ids, so each run must be graded against the rows of the dataset
+    # it was actually launched from rather than a merged table. The oracle
+    # columns agree across datasets, but only the missing-info rows carry the
+    # PASS_TO_PASS repaired from Excel truncation.
+    by_dataset = {dataset: load_rows(dataset) for dataset in DATASETS}
+
+    def rows_for(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return by_dataset[dataset_of(summary)]
+
     stored = load_evaluations(logs_root)
 
     def is_graded(run_id: str | None) -> bool:
@@ -588,16 +662,16 @@ def command_evaluate(args: argparse.Namespace) -> None:
     ]
     for summary in selected:
         instance_id = summary.get("task", {}).get("instance_id")
-        if instance_id not in rows:
+        if instance_id not in rows_for(summary):
             print(
                 f"WARNING: {summary.get('run_id')}: unknown instance "
-                f"{instance_id}; skipped",
+                f"{instance_id} in dataset {dataset_of(summary)}; skipped",
                 flush=True,
             )
     selected = [
         summary
         for summary in selected
-        if summary.get("task", {}).get("instance_id") in rows
+        if summary.get("task", {}).get("instance_id") in rows_for(summary)
     ]
     if not selected:
         raise SystemExit(
@@ -616,6 +690,12 @@ def command_evaluate(args: argparse.Namespace) -> None:
         f"harness (dataset {swebench_eval.DATASET_NAME})",
         flush=True,
     )
+    # Build the grading table from each selected run's own dataset, so a run
+    # is never graded against another dataset's copy of its instance_id.
+    rows = {
+        summary["task"]["instance_id"]: rows_for(summary)[summary["task"]["instance_id"]]
+        for summary in selected
+    }
     evaluations = swebench_eval.evaluate_with_harness(
         logs_root=logs_root,
         rows=rows,
@@ -647,12 +727,31 @@ def command_report(args: argparse.Namespace) -> None:
 
 
 def command_batch(args: argparse.Namespace) -> None:
-    rows = list(load_rows().values())
+    conditions = resolve_conditions(
+        args.dataset, requested_conditions(args.condition, args.dataset)
+    )
+    rows = list(load_rows(args.dataset).values())
+
+    # The missing-info workbook leaves four instances unannotated, so they have
+    # no ambiguous rewrite to present. Drop them with a visible count rather
+    # than failing the batch partway through.
+    runnable = [
+        row
+        for row in rows
+        if all((row.get(CONDITION_FIELD[c]) or "").strip() for c in conditions)
+    ]
+    if len(runnable) != len(rows):
+        print(
+            f"Skipping {len(rows) - len(runnable)} instance(s) with no text for "
+            f"condition {'/'.join(conditions)} in {args.dataset}",
+            flush=True,
+        )
+    rows = runnable
+
     if args.count <= 0 or args.count > len(rows):
         raise SystemExit(f"--count must be between 1 and {len(rows)}")
 
     logs_root = Path(args.logs_dir) if args.logs_dir else default_logs_root()
-    conditions = requested_conditions(args.condition)
     selected = select_batch_rows(
         rows,
         completed_run_keys(logs_root),
@@ -668,9 +767,9 @@ def command_batch(args: argparse.Namespace) -> None:
     session_count = sum(len(missing) for _, missing in selected)
     print(
         f"Batch: {len(selected)} dataset instances, {session_count} session(s), "
-        f"condition={args.condition}, model={args.model} "
+        f"dataset={args.dataset}, condition={args.condition}, model={args.model} "
         f"(runner={runner_for_model(args.model)}, "
-        f"{len(rows)} instances in the dataset)",
+        f"{len(rows)} runnable instances in the dataset)",
         flush=True,
     )
     # Certify the ask channel before spending a batch of sessions on it.
@@ -687,6 +786,7 @@ def command_batch(args: argparse.Namespace) -> None:
                 command_run(
                     argparse.Namespace(
                         instance_id=row["instance_id"],
+                        dataset=args.dataset,
                         condition=condition,
                         model=args.model,
                         dry_run=args.dry_run,
@@ -704,14 +804,17 @@ def parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("list", help="list available dataset instances")
     ls.add_argument("--limit", type=int, default=20)
     ls.add_argument("--repo", help="optional exact owner/name repository filter")
+    ls.add_argument("--dataset", choices=DATASETS, default=DEFAULT_DATASET, help=DATASET_HELP)
     ls.set_defaults(func=command_list)
 
     run = sub.add_parser("run", help="launch one unattended agent session")
     run.add_argument("instance_id")
+    run.add_argument("--dataset", choices=DATASETS, default=DEFAULT_DATASET, help=DATASET_HELP)
     run.add_argument(
         "--condition",
         choices=tuple(CONDITION_FIELD),
         default="ambiguous",
+        help=CONDITION_HELP,
     )
     run.add_argument("--model", default=DEFAULT_MODEL, help=MODEL_HELP)
     run.add_argument("--dry-run", action="store_true")
@@ -732,10 +835,16 @@ def parser() -> argparse.ArgumentParser:
         help="number of instances to run, counted within --scope",
     )
     batch.add_argument(
+        "--dataset", choices=DATASETS, default=DEFAULT_DATASET, help=DATASET_HELP
+    )
+    batch.add_argument(
         "--condition",
         choices=BATCH_CONDITIONS,
         default="ambiguous",
-        help="run ambiguous, full, or both conditions for each selected instance",
+        help=(
+            "condition to run for each selected instance, or 'both' for the "
+            f"selected dataset's pair. {CONDITION_HELP}"
+        ),
     )
     batch.add_argument("--model", default=DEFAULT_MODEL, help=MODEL_HELP)
     batch.add_argument("--dry-run", action="store_true")

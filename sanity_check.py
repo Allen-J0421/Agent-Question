@@ -81,6 +81,24 @@ def agent_of(record: dict) -> dict:
     return {}
 
 
+def dataset_of(record: dict) -> str | None:
+    """Issue source; explicit `dataset` key, else inferred from the condition.
+
+    Mirrors `study_log.dataset_of`. This script stays dependency-free on the
+    harness modules on purpose, the same way `agent_of` is duplicated above.
+    """
+    task = record.get("task", {})
+    recorded = task.get("dataset")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    condition = task.get("condition")
+    if condition in ("mi_ambiguous", "mi_full"):
+        return "missing-info"
+    if condition in ("ambiguous", "full"):
+        return "interactive-swe"
+    return None
+
+
 def is_claude_run(record: dict) -> bool:
     return str(agent_of(record).get("runner") or "claude-sdk").startswith("claude")
 
@@ -277,6 +295,7 @@ def clean_dead(
         to_clean.append({
             "kind": "dead", "stem": rid, "instance_id": task.get("instance_id"),
             "condition": task.get("condition"),
+            "dataset": dataset_of(summary),
             "model": agent_of(summary).get("model"),
         })
     for mid, manifest in manifests.items():
@@ -286,6 +305,7 @@ def clean_dead(
         to_clean.append({
             "kind": "interrupted", "stem": mid, "instance_id": task.get("instance_id"),
             "condition": task.get("condition"),
+            "dataset": dataset_of(manifest),
             "model": agent_of(manifest).get("model"),
         })
 
@@ -679,9 +699,14 @@ def main() -> int:
                     )
                     continue
                 model_flag = f" --model {entry['model']}" if entry.get("model") else ""
+                # --dataset must accompany a mi_* condition or the rerun is
+                # rejected as a cross-dataset condition.
+                dataset_flag = (
+                    f" --dataset {entry['dataset']}" if entry.get("dataset") else ""
+                )
                 print(
-                    f"  {py} experiment.py run {entry['instance_id']} "
-                    f"--condition {entry['condition']}{model_flag}"
+                    f"  {py} experiment.py run {entry['instance_id']}"
+                    f"{dataset_flag} --condition {entry['condition']}{model_flag}"
                 )
         return 1  # quarantining just proved something needed attention
 

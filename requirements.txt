@@ -2,3 +2,5 @@ datasets
 claude-agent-sdk
 swebench
 cbor2<6  # 6.x ships no macOS wheels and needs a Rust toolchain to build
+pandas
+openpyxl  # pandas needs it to read data/missing-info/data.xlsx
