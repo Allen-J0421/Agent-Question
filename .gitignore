@@ -11,7 +11,9 @@ __pycache__/
 # Repository checkouts created by the minimal interactive launcher
 .experiment-checkouts/
 
-# Immutable Claude session copies and derived AskUserQuestion study reports
+# Immutable experiment logs. The dashboard is built to index.html at the repo
+# root instead of into this directory, so the whole thing stays ignored and the
+# published page never drags the raw run artifacts along with it.
 .experiment-logs/
 
 # Large dataset binary — the immutable research input, stored separately (not in git

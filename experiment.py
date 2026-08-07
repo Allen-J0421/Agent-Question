@@ -41,7 +41,6 @@ from study_log import (
     preserve_codex_session_artifacts,
     preserve_session_artifacts,
     write_evaluation,
-    write_report,
     write_run_summary,
 )
 
@@ -715,15 +714,7 @@ def command_evaluate(args: argparse.Namespace) -> None:
             f"P2P={evaluation['p2p_passed']}/{evaluation['p2p_total']}",
             flush=True,
         )
-    print("\nRun `experiment.py report` to regenerate the aggregates.", flush=True)
-
-
-def command_report(args: argparse.Namespace) -> None:
-    logs_root = Path(args.logs_dir) if args.logs_dir else default_logs_root()
-    paths = write_report(logs_root)
-    print("Wrote AskUserQuestion report:")
-    for kind, path in paths.items():
-        print(f"  {kind}: {path}")
+    print("\nRun `dashboard.py` to regenerate index.html with these grades.", flush=True)
 
 
 def command_batch(args: argparse.Namespace) -> None:
@@ -911,10 +902,6 @@ def parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--model", default=DEFAULT_MODEL, help=MODEL_HELP)
     preflight.set_defaults(func=command_preflight)
-
-    report = sub.add_parser("report", help="aggregate AskUserQuestion run logs")
-    report.add_argument("--logs-dir", help="log directory created by the run command")
-    report.set_defaults(func=command_report)
     return p
 
 

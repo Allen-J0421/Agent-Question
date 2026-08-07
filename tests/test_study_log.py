@@ -206,27 +206,6 @@ def _summary(run_id: str, asked: bool | None) -> dict:
     }
 
 
-def test_report_writes_csv_json_and_markdown(tmp_path):
-    logs_root = tmp_path / "logs"
-    study_log.write_run_summary(logs_root, _summary("asked", True))
-    study_log.write_run_summary(logs_root, _summary("not-asked", False))
-    study_log.write_run_summary(logs_root, _summary("unknown", None))
-
-    paths = study_log.write_report(logs_root)
-    report = json.loads(paths["json"].read_text(encoding="utf-8"))
-
-    assert report["runs"]["total"] == 3
-    assert report["runs"]["valid_for_primary_outcome"] == 2
-    assert report["runs"]["direct_ask_rate"] == 0.5
-    assert "direct_asked" in paths["csv"].read_text(encoding="utf-8")
-    markdown = paths["markdown"].read_text(encoding="utf-8")
-    # Headline rate, a per-run table row for each logged run, and pointers
-    # to the sibling CSV/JSON so the Markdown view is self-sufficient.
-    assert "**1/2** valid runs (50.0%)" in markdown
-    assert "asked" in markdown and "not-aske" in markdown and "unknown" in markdown
-    assert "run-summary.csv" in markdown and "askuserquestion-report.json" in markdown
-
-
 def test_build_report_breaks_out_results_by_condition():
     # by_condition is the study's actual independent variable (ambiguous vs
     # full); it must not collapse across conditions the way an aggregate
@@ -410,8 +389,7 @@ def test_report_compares_resolution_between_asking_and_non_asking_runs(tmp_path)
     study_log.write_run_summary(logs_root, _eval_summary("b", False, _eval(resolved=False)))
     study_log.write_run_summary(logs_root, _eval_summary("c", False, _eval(resolved=True)))
 
-    report = json.loads(study_log.write_report(logs_root)["json"].read_text())
-    block = report["evaluation"]
+    block = _report_from(logs_root)["evaluation"]
 
     assert block["evaluated"] == 3
     assert block["scored"] == 3
@@ -420,6 +398,19 @@ def test_report_compares_resolution_between_asking_and_non_asking_runs(tmp_path)
     assert block["by_asked"]["asked"]["resolve_rate"] == 1.0
     assert block["by_asked"]["not_asked"]["resolved"] == 1
     assert block["by_asked"]["not_asked"]["resolve_rate"] == 0.5
+
+
+def _report_from(logs_root):
+    """Build the aggregates the way dashboard.py does.
+
+    `attach_evaluations` is pure, so its return value must be used -- ignoring
+    it silently drops every stored grade.
+    """
+    summaries, errors = study_log.load_run_summaries(logs_root)
+    summaries = study_log.attach_evaluations(
+        summaries, study_log.load_evaluations(logs_root)
+    )
+    return study_log.build_report(summaries, errors)
 
 
 def test_report_excludes_ungradable_runs_from_the_resolve_rate(tmp_path):
@@ -436,35 +427,13 @@ def test_report_excludes_ungradable_runs_from_the_resolve_rate(tmp_path):
         _eval_summary("c", False, _eval(status="env_unavailable", resolved=None)),
     )
 
-    report = json.loads(study_log.write_report(logs_root)["json"].read_text())
-    block = report["evaluation"]
+    block = _report_from(logs_root)["evaluation"]
 
     assert block["evaluated"] == 3
     assert block["scored"] == 1
     assert block["resolve_rate"] == 1.0
     assert block["status_counts"]["unsupported_runner"] == 1
     assert block["status_counts"]["env_unavailable"] == 1
-
-
-def test_report_csv_includes_the_evaluation_columns(tmp_path):
-    logs_root = tmp_path / "logs"
-    study_log.write_run_summary(logs_root, _eval_summary("a", False, _eval()))
-
-    text = study_log.write_report(logs_root)["csv"].read_text(encoding="utf-8")
-
-    assert "eval_status" in text and "resolved" in text
-    assert "localization_hit" in text
-    assert "scored" in text
-
-
-def test_report_markdown_reports_the_asked_versus_not_asked_split(tmp_path):
-    logs_root = tmp_path / "logs"
-    study_log.write_run_summary(logs_root, _eval_summary("a", True, _eval(resolved=True)))
-
-    text = study_log.write_report(logs_root)["markdown"].read_text(encoding="utf-8")
-
-    assert "Patch evaluation" in text
-    assert "asked" in text
 
 
 def test_evaluations_are_stored_separately_and_can_be_overwritten(tmp_path):
@@ -500,7 +469,7 @@ def test_a_stored_evaluation_overrides_one_embedded_in_an_older_summary(tmp_path
     study_log.write_run_summary(logs_root, summary)
     study_log.write_evaluation(logs_root, "run-1", _eval(resolved=True))
 
-    report = json.loads(study_log.write_report(logs_root)["json"].read_text())
+    report = _report_from(logs_root)
 
     assert report["evaluation"]["resolved"] == 1
     assert report["evaluation"]["resolve_rate"] == 1.0
@@ -724,9 +693,7 @@ def test_report_keeps_models_apart_and_supports_comparison(tmp_path):
                     "task": {"instance_id": "i1", "condition": "full"}},
     )
 
-    paths = study_log.write_report(logs_root)
-    report = json.loads(paths["json"].read_text(encoding="utf-8"))
-    models = report["models"]
+    models = _report_from(logs_root)["models"]
 
     assert set(models) == {"claude-opus-4-8", "gpt-5.6-sol"}
     claude_cell = models["claude-opus-4-8"]
@@ -740,14 +707,6 @@ def test_report_keeps_models_apart_and_supports_comparison(tmp_path):
     assert gpt_cell["by_condition"]["ambiguous"]["resolution"]["resolved"] == 0
     assert gpt_cell["by_condition"]["full"]["resolution"]["resolved"] == 1
     assert claude_cell["by_condition"]["ambiguous"]["ask"]["ask_rate"] == 1.0
-
-    csv_text = paths["csv"].read_text(encoding="utf-8")
-    assert "runner" in csv_text and "ask_channel" in csv_text
-    assert "codex-cli" in csv_text and "final_message" in csv_text
-
-    markdown = paths["markdown"].read_text(encoding="utf-8")
-    assert "## Model comparison" in markdown
-    assert "gpt-5.6-sol" in markdown and "claude-opus-4-8" in markdown
 
 
 def test_codex_transcript_marks_the_final_message_of_each_round():

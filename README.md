@@ -29,7 +29,7 @@ $PY experiment.py run <instance_id> --model gpt-5.6-sol       # same instance, G
 $PY experiment.py batch --count 50 --condition both           # next incomplete instances, sequentially
 $PY experiment.py batch --count 50 --condition both --model gpt-5.6-sol   # same batch, GPT arm
 $PY experiment.py evaluate                                    # grade stored patches (Docker required)
-$PY experiment.py report                                      # per-model asks + grades + comparison
+$PY dashboard.py                                              # rebuild index.html: aggregates + per-run drill-down
 $PY sanity_check.py --last 10                                 # health-check recent runs
 $PY locate_logs.py <instance_id>                              # find all artifacts for one instance
 ```
@@ -43,7 +43,8 @@ over the same instances never skips or clobbers the first arm.
 
 ```
 ambig-SWE/
-├── experiment.py            ← CLI entry point: list / preflight / run / batch / evaluate / report
+├── index.html               ← the generated dashboard (rebuild with dashboard.py; GitHub Pages serves it)
+├── experiment.py            ← CLI entry point: list / preflight / run / batch / evaluate
 │                              (--model routes to the right runner)
 ├── locate_logs.py           ← map a dataset instance_id to every stored artifact of its runs
 ├── sdk_runner.py            ← one unattended Claude Agent SDK session (can_use_tool callback,
@@ -54,7 +55,9 @@ ambig-SWE/
 │                              pattern categories from config/ask_detection.json
 ├── reclassify_asks.py       ← re-run the ask classifier over stored runs' preserved event
 │                              streams; disagreement + per-pattern firing audit (read-only)
-├── study_log.py             ← manifests, run summaries, and the per-model aggregate report builder
+├── study_log.py             ← manifests, run summaries, and the per-model aggregate builder
+├── dashboard.py             ← build a self-contained HTML dashboard over every stored run
+├── dashboard_template.html  ← its markup/CSS/JS shell; the build inlines the data into it
 ├── swebench_eval.py         ← patch capture + grading via the official SWE-bench harness (Docker)
 ├── sanity_check.py          ← read-only health report for recent runs; exit code gates automation
 ├── config/
@@ -275,7 +278,6 @@ $PY locate_logs.py 13398 --condition ambiguous --json
 | `run <instance_id>` | Run one condition for one instance. | `--condition`, `--model`, `--dry-run` |
 | `batch --count N` | Run the next incomplete instances sequentially. | `--condition ambiguous\|full\|both`, `--model`, `--skip-preflight` |
 | `evaluate` | Grade saved patches without re-running any session. | `--run-id`, `--force`, `--max-workers`, `--eval-timeout` |
-| `report` | Rebuild CSV, JSON, and Markdown aggregates — per model, per condition, and a model-comparison table. | `--logs-dir` |
 
 `--model` accepts any `claude-*` slug (Claude Agent SDK) or `gpt-*`/`codex-*`
 slug (Codex CLI). `gpt-5.6-sol` is the primary GPT arm; `gpt-5.6-terra` is
@@ -289,27 +291,82 @@ Standalone scripts:
 |---|---|---|
 | `sanity_check.py` | Health report: session outcomes, ask-channel integrity, patch self-consistency, grading state, rerun hygiene. Exit 1 when something needs attention. | `--last N`, `--logs-dir` |
 | `locate_logs.py [instance]` | Map an instance_id (or substring) to every artifact of its runs; no argument prints the index. | `--condition`, `--json`, `--logs-dir` |
-| `study_log.py` | Standalone report builder (same aggregates as `report`). | `--logs-dir` |
+| `dashboard.py` | Rebuild `index.html`: a self-contained browsable view of every run — aggregates plus tool trace, messages, verbatim prompt, patch, and grade. Read-only. | (none) |
 | `reclassify_asks.py` | Re-apply the ask classifier to every stored Codex run's preserved events; report disagreements vs recorded verdicts, per-pattern firing counts, and the pre-work/post-work split. Read-only. | `--config`, `--json`, `--logs-dir` |
 | `harvest_asks.py` | Live classifier validation: run 10 ambiguity-forcing sandbox tasks against gpt-5.6-sol, collect the real ask messages, and score the classifier on them. Spends ~10 short Codex sessions; rerun after pattern changes and fold misses into the test corpus. | (none) |
 
-## Reporting and model comparison
+## Dashboard
 
-`report` writes three views under `.experiment-logs/reports/`, and every one
-of them separates models:
+`dashboard.py` takes no arguments. It reads `.experiment-logs/` and rewrites
+`index.html` at the repo root — one self-contained file that opens by
+double-click, with no server and no network access:
 
-- **JSON** (`askuserquestion-report.json`): a `models` section with, per
-  model, ask rate, resolution, the ask channel it was measured on, and a
-  per-condition split — nothing is ever pooled across models.
-- **CSV** (`run-summary.csv`): one row per run with `model`, `runner`, and
-  `ask_channel` columns for downstream analysis.
-- **Markdown** (`askuserquestion-report.md`): a "Model comparison" table
-  (model × condition: runs, ask rate, resolve rate) plus the per-condition,
-  per-difficulty, and asked-vs-not-asked slices and the all-runs table.
+```bash
+$PY dashboard.py && open index.html
+```
 
-The ask channels differ by construction (tool call vs. final-message
-question), so the comparison is "did the agent stop to ask", and each arm's
-channel is printed next to its rates rather than hidden.
+It is written to the repo root rather than into the (git-ignored) log
+directory so `.gitignore` stays simple and GitHub Pages can serve it as-is.
+Because the page is therefore shareable, the build rewrites local machine
+paths to `<repo>` and `~` — the published page carries no home directory.
+
+**Model comparison never pools arms.** Each model is its own study arm, and
+the ask channels differ by construction (tool call vs. final-message
+question), so the overview renders one column per arm with its channel named
+next to its rates. The comparison is "did the agent stop to ask", not "how
+often was one tool called".
+
+Beyond the aggregates (taken from `study_log.build_report`, never recomputed)
+it adds per-run drill-down: a **tool trace** unified across both runners, the
+**agent's messages** with any clarifying question rendered as the interaction
+it was, the **verbatim prompt** the agent received, and the **patch beside the
+grader's verdict**. Filter by dataset, arm, condition, asked, resolved, repo,
+or difficulty; press `?` for keyboard shortcuts.
+
+Two things worth knowing about what it shows:
+
+- **Prompts are reconstructed, not stored.** The logs keep only
+  `task.prompt_sha256`, so the prompt is rebuilt from the dataset and the hash
+  re-checked; the panel shows a ✓ VERIFIED badge only when it matches. On a
+  paired run you can diff the two conditions' prompts against each other,
+  which renders the experimental manipulation directly.
+- **It is deliberately conservative about rates.** Ask rate excludes runs
+  where asking was unobservable, resolve rate counts only scored runs, and a
+  percentage is demoted to a caption when the denominator or the event count
+  is too small to support one — `1/31` is shown as a fraction, not as "3.2%".
+
+### The Prompt panel's sub-views
+
+The Prompt panel carries the dataset's own context for the task, switched by a
+chip row. The chip marked `sent` is the text the agent actually received and is
+the default; the ✓ VERIFIED badge dims on any other view, because the hash
+certifies that one text and nothing else.
+
+| view | shows |
+|---|---|
+| `ambiguous` / `full` | both condition texts for this instance |
+| `side by side` | the full issue beside the rewrite, with removed spans highlighted where they can be located |
+| `withheld` | *(missing-info)* the categories removed, each with its probe question and the verbatim spans, beside what the agent actually asked |
+| `present` | *(missing-info)* which of the six categories the issue contained at all |
+| `baselines` | *(missing-info)* the workbook's GRPO and GPT-5 clarification questions for this instance |
+| `mi rewrite` | *(interactive-swe)* the other dataset's independent rewrite of the same issue |
+
+`side by side` is not a word diff on purpose: the ambiguous texts share only
+7–28% of their words with the full issue because they were written
+independently rather than redacted, and a word-level diff of two such texts
+interleaves into noise.
+
+**`index.html` contains the masking answer keys.** They sit in one top-level
+`keys` block, per instance, and never inside a run record — judging whether an
+agent asked for the missing information means reading its question next to what
+was missing. The runs are finished and immutable, so reading the key cannot
+change what any agent did. The build checks the invariant that matters: no
+withheld span survives in the ambiguous prompt it was cut from.
+
+The build inlines the trace, so the file grows with the log directory (~4.4 MB
+at 58 runs, of which the keys are ~110 KB). Long tool outputs are truncated
+head-and-tail with the byte count and the source artifact path kept, so nothing
+is unrecoverable.
 
 ## Notes
 
@@ -334,3 +391,22 @@ channel is printed next to its rates rather than hidden.
   `swebench` Docker Hub namespace (arm64 images exist for most instances; pass
   `--swebench-namespace ''` to build locally instead).
 - The dataset schema is documented in [`data/README.md`](data/README.md).
+
+## Datasets and citation
+
+The two datasets in [`data/`](data/) were **not created here** — they are
+third-party research artifacts, redistributed for reproducibility. Both derive
+from SWE-bench Verified. If you use them, cite the paper that created each:
+
+- **`interactive-swe/`** — Vijayvargiya, Zhou, Yerukola, Sap, Neubig.
+  *Ambig-SWE: Interactive Agents to Overcome Underspecificity in Software
+  Engineering.* ICLR 2026. [arXiv:2502.13069](https://arxiv.org/abs/2502.13069)
+- **`missing-info/data.xlsx`** — Vijayvargiya, Viswanathan, Neubig.
+  *Asking What Matters: Reward-Driven Clarification for Software Engineering
+  Tasks.* [arXiv:2604.14624](https://arxiv.org/abs/2604.14624)
+- **Underlying benchmark** — Jimenez et al., *SWE-bench* ([arXiv:2310.06770](https://arxiv.org/abs/2310.06770));
+  Chowdhury et al., *SWE-bench Verified* (OpenAI, 2024).
+
+This repository contributes the harness, not the data. Full provenance, the
+evidence tying each file to its paper, and licensing notes are in
+[`data/README.md`](data/README.md#provenance-and-citation).

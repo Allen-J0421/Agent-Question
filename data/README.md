@@ -4,14 +4,16 @@ This directory contains two separate datasets, both derived from the same 500-ta
 [SWE-bench Verified](https://www.swebench.com/) source benchmark. They serve different research
 purposes and have different formats.
 
-| Dataset | Location and format | Use it for |
-|---|---|---|
-| **1. Interactive SWE** | `interactive-swe/` — 15-column Hugging Face/Arrow dataset | Running software-agent experiments and evaluating patches under ambiguous versus full issue text. |
-| **2. Missing Information** | `missing-info/data.xlsx` — 28-column Excel dataset | Measuring whether an agent identifies and asks for deliberately hidden categories of issue information. |
+| Dataset | Location and format | Source | Use it for |
+|---|---|---|---|
+| **1. Interactive SWE** | `interactive-swe/` — 15-column Hugging Face/Arrow dataset | Vijayvargiya et al., *Ambig-SWE* (ICLR 2026) | Running software-agent experiments and evaluating patches under ambiguous versus full issue text. |
+| **2. Missing Information** | `missing-info/data.xlsx` — 28-column Excel dataset | Vijayvargiya et al., *Asking What Matters* (CLARITI) | Measuring whether an agent identifies and asks for deliberately hidden categories of issue information. |
 
-The datasets share task provenance, but neither should be treated as a replacement for the other:
-Interactive SWE is the runnable benchmark input; Missing Information is the richer annotation and
-clarification-analysis dataset.
+**Neither dataset was created here.** Both are third-party research artifacts, redistributed for
+reproducibility; see [Provenance and citation](#provenance-and-citation) for the full references,
+what this repository added, and licensing. The datasets share task provenance, but neither replaces
+the other: Interactive SWE is the runnable benchmark input; Missing Information is the richer
+annotation and clarification-analysis dataset.
 
 ## Layout
 
@@ -31,6 +33,10 @@ data/
 ---
 
 ## Dataset 1 — `interactive-swe/`
+
+> From **Ambig-SWE** (Vijayvargiya et al., ICLR 2026),
+> [arXiv:2502.13069](https://arxiv.org/abs/2502.13069). Redistributed here for reproducibility —
+> see [Provenance and citation](#provenance-and-citation).
 
 `interactive-swe` is the dataset consumed by the experiment scripts. It presents every task in two
 forms:
@@ -109,6 +115,10 @@ with pa.memory_map(path, "r") as src:
 
 ## Dataset 2 — `missing-info/data.xlsx`
 
+> From **Asking What Matters** / CLARITI (Vijayvargiya et al.),
+> [arXiv:2604.14624](https://arxiv.org/abs/2604.14624). Redistributed here for reproducibility —
+> see [Provenance and citation](#provenance-and-citation).
+
 This 500-row, 28-column companion workbook explains what was hidden from each issue and supports
 direct evaluation of clarification questions.
 
@@ -117,6 +127,9 @@ The harness runs it directly via `--dataset missing-info`, which pairs the condi
 [Running it through the harness](#running-it-through-the-harness) below.
 
 ### How one row is constructed
+
+This pipeline is the source paper's (its §3.1 and Appendix A.2), run with GPT-5 as the annotator
+and rewriter — not something reproduced here:
 
 ```text
 complete original issue
@@ -127,7 +140,8 @@ complete original issue
   → collect baseline model questions for rewrite_3
 ```
 
-The six categories are:
+The six categories are the paper's taxonomy, derived from 112 highly-underspecified SWE-bench
+Verified issues whose expert annotations flagged missing information (its §2.1 and Table 1):
 
 - Error Information
 - Reproduction Steps
@@ -239,8 +253,8 @@ python experiment.py batch --dataset missing-info --condition mi_ambiguous --cou
 
 The conditions are named `mi_*` rather than reusing `ambiguous`/`full` because both datasets cover
 the same 500 `instance_id`s; distinct names keep resume state, checkout directories, and every
-aggregate report from conflating the two. Runs record their source in `task.dataset`, which also
-appears as a `dataset` column in `reports/run-summary.csv`.
+aggregate from conflating the two. Runs record their source in `task.dataset`, which the dashboard
+exposes as a `dataset` filter.
 
 Three normalizations happen at load time:
 
@@ -267,16 +281,98 @@ recall.
 - **Incomplete annotations:** four rows have no downstream annotation. Another 17 have empty
   `hidden_categories_3`; exclude both groups from category-recall evaluation, leaving 479 usable
   variant-3 rows.
-- **Implementation Details label bug:** `hidden_categories_k` under-reports this category. In 174
-  variant-3 rows, the corresponding `hidden_info_3` segment has an empty category name; only 36 of
-  those rows name it in `hidden_categories_3`. Recover this category from `hidden_info_k` before
-  reporting metrics that involve it.
+- **Implementation Details label bug:** one probe lost its category name upstream. In 174
+  variant-3 rows the `hidden_info_3` segment beginning `": Where in the codebase should we
+  look?…"` has an empty category name, and `hidden_categories_3` mirrors the gap as an empty
+  comma-slot. 36 of those rows name the category anyway, so recognising the probe recovers **138
+  more** — taking Implementation Details from 117 rows to 255. Everything else in these two
+  columns is sound: on every *named* segment they agree in all 500 rows.
+  `datasets_registry.load_answer_keys` applies this repair and sets `repaired` on the affected
+  rows; read categories from there rather than parsing `hidden_categories_k` directly, or you
+  will undercount by roughly 15% of all hidden categories.
 - **Correlated variants:** do not put variants of the same `instance_id` into different training and
   test splits.
 
-## Provenance
+## Provenance and citation
 
-Both datasets are derived from SWE-bench Verified (Jimenez et al., *SWE-bench: Can Language Models
-Resolve Real-World GitHub Issues?*). `interactive-swe` adds the ambiguous `problem_statement`,
-full `original_issue`, and `files` fields. The workbook adds the information-category annotations,
-rewrite variants, and clarification-question baselines.
+Both datasets are **third-party research artifacts**, not original contributions of this
+repository. Both derive from SWE-bench Verified, and each was produced by a separate paper from
+the same CMU group. If you use either, cite the paper that created it — and cite SWE-bench and
+SWE-bench Verified underneath, since both are downstream of that benchmark.
+
+### Dataset 1 — `interactive-swe/`
+
+> Sanidhya Vijayvargiya, Xuhui Zhou, Akhila Yerukola, Maarten Sap, Graham Neubig.
+> **Ambig-SWE: Interactive Agents to Overcome Underspecificity in Software Engineering.**
+> ICLR 2026. [arXiv:2502.13069](https://arxiv.org/abs/2502.13069) ·
+> [code](https://github.com/sani903/InteractiveSWEAgents)
+
+The `problem_statement` field is that paper's **Hidden setting** input: a GPT-4o abstractive
+summary generated with the "Prompt For Summarizing GitHub Issues" in its Appendix A.2.3, which asks
+for a summary "abstract enough that a code agent would not be able to solve the issue based on this
+information but would understand the general problem." `original_issue` is the paper's **Full
+setting** input.
+
+*Verified against this copy:* 500 rows; `problem_statement` averages 377 chars against 1,700 for
+`original_issue`; **261 of 500 original issues contain a code block or traceback and none of the
+rewrites do**, matching the paper's description of "more aggressive information removal,
+specifically targeting code snippets and error messages"; unigram recall against the original
+averages 0.22, close to the ROUGE-1 recall of 0.179 reported in the paper's Table 3.
+
+### Dataset 2 — `missing-info/data.xlsx`
+
+> Sanidhya Vijayvargiya, Vijay Viswanathan, Graham Neubig.
+> **Asking What Matters: Reward-Driven Clarification for Software Engineering Tasks.**
+> [arXiv:2604.14624](https://arxiv.org/abs/2604.14624) ·
+> [code](https://github.com/sani903/Teaching-Effective-Clarification)
+
+This is that paper's **categorization-grounded evaluation dataset** (its §3.1): 500 SWE-bench
+Verified issues annotated for six information categories, each with three underspecified rewrites
+produced by removing randomly selected subsets of the categories present. The paper's own numbers
+match this file exactly — "500 issues × 3 rewrites", one rewrite selected per issue for the
+clarification experiments, and the six-category taxonomy of its Table 1.
+
+*Verified against this copy:* the `category_mapping` column carries exactly the paper's six
+categories in all 496 annotated rows, and the probe questions embedded in `hidden_info_*` are
+**verbatim** the taxonomy definitions from Prompt 1 in its Appendix A.2 — e.g. `Error Information:
+What is going wrong, why is it wrong, and how do we know? (e.g., stack traces, error strings,
+incorrect output descriptions, …)`. The `clarification_questions_{grpo,gpt5_nano,gpt5}_3` columns
+are that paper's baseline systems (its CLARITI/GRPO model, GPT-5 nano, and GPT-5).
+
+The paper's own reported category-impact weights are worth knowing when scoring against this
+workbook, since the categories are **not** equally important to task success (its RQ1, Table 11):
+
+| Category | Impact weight | Frequency in underspecified issues |
+|---|---:|---:|
+| Error Information | 1.00 | 65% |
+| Implementation Details | 0.60 | 37% |
+| Version/Environment | 0.59 | 3% |
+| Expected Behavior | 0.58 | 33% |
+| Reproduction Steps | 0.42 | 12% |
+| External References | 0.23 | 15% |
+
+### Underlying benchmark
+
+> Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, Karthik
+> Narasimhan. **SWE-bench: Can Language Models Resolve Real-World GitHub Issues?** ICLR 2024.
+> [arXiv:2310.06770](https://arxiv.org/abs/2310.06770)
+
+> Neil Chowdhury et al. **Introducing SWE-bench Verified.** OpenAI, 2024.
+> [link](https://openai.com/index/introducing-swe-bench-verified/)
+
+The `repo`, `instance_id`, `base_commit`, `patch`, `test_patch`, `FAIL_TO_PASS`, `PASS_TO_PASS`,
+`environment_setup_commit`, `version`, and `created_at` columns in both datasets come from
+SWE-bench Verified unchanged. `difficulty` is its expert-annotated effort estimate.
+
+### What this repository added
+
+Nothing in the datasets themselves. This repository contributes only the harness around them: the
+schema normalization in [`datasets_registry.py`](../datasets_registry.py), the repair of 26
+Excel-truncated `PASS_TO_PASS` cells and 130 Excel-mangled `version` values, and the run/evaluation
+tooling. The issue text, annotations, rewrites, and baselines are unmodified.
+
+### Licensing
+
+Both datasets inherit the licensing of their source papers and of SWE-bench; check each project's
+repository before redistributing. They are included here for reproducibility of the experiments in
+this repository, not as an independent data release.

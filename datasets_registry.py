@@ -189,7 +189,7 @@ def _normalize_workbook_row(
 
     ``version``
         Excel coerced version strings to floats ("5.0" -> 5, "5.1" ->
-        5.0999999999999996) in 215 rows. The official harness keys
+        5.0999999999999996) in 130 rows. The official harness keys
         environments off ``instance_id``, so this never reaches grading, but a
         corrupted value should not be recorded either.
     """
@@ -248,20 +248,71 @@ def split_categories(value: Any) -> list[str]:
     return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
+# The Implementation Details probe, which is the one segment whose category
+# name was stripped upstream. Measured across variant 3: 174 rows carry a
+# segment with an empty category name, every one of them this probe, and
+# `hidden_categories_3` mirrors the gap as an empty comma-slot. 36 of those
+# rows name the category anyway, so recognising the probe recovers 138 more.
+HEADLESS_PROBE_PREFIX = "Where in the codebase"
+HEADLESS_PROBE_CATEGORY = "Implementation Details"
+
+
+def parse_hidden_info(value: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Parse a ``hidden_info_k`` cell into segments, repairing the lost label.
+
+    The cell encodes ``Category: <probe question> | Examples: <spans>`` joined
+    by ``||``. Returns ``(segments, repaired)`` where each segment is
+    ``{"category", "probe", "examples"}`` and ``repaired`` says whether a
+    category name had to be recovered from its probe text.
+
+    Every consumer previously re-parsed this encoding by hand; doing it once
+    here is also what makes the repair apply to scoring rather than only to a
+    display surface.
+    """
+    segments: list[dict[str, Any]] = []
+    repaired = False
+    for chunk in str(value or "").split("||"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        head, _, body = chunk.partition(":")
+        category = head.strip()
+        if not category:
+            # The name was stripped upstream; recover it from the probe.
+            if body.strip().startswith(HEADLESS_PROBE_PREFIX):
+                category = HEADLESS_PROBE_CATEGORY
+                repaired = True
+            else:
+                category = "(uncategorised)"
+        probe, _, examples = body.partition("| Examples:")
+        segments.append(
+            {
+                "category": category,
+                "probe": probe.strip(),
+                "examples": [e.strip() for e in examples.split(";") if e.strip()],
+            }
+        )
+    return segments, repaired
+
+
 def load_answer_keys(
     dataset: str = MISSING_INFO, variant: int = 3
 ) -> dict[str, dict[str, Any]]:
     """Return the masking answer key for scoring clarification questions.
 
-    EVALUATOR ONLY. Never import this from the run path -- these fields state
-    exactly which information was withheld from the prompt.
+    EVALUATOR ONLY. These fields state exactly which information was withheld
+    from the prompt, so nothing on the run path may import this.
 
-    ``hidden_categories`` is the compact label ("did the agent ask for the
-    right *kind* of information?"); ``hidden_info`` is the detailed key ("could
-    the agent's question recover a specific removed fact?").
+    ``hidden_categories`` answers "did the agent ask for the right *kind* of
+    information?"; ``hidden`` carries the detailed key -- per category, the
+    probe question it stands for and the verbatim spans that were removed.
 
-    Note that ``hidden_categories_k`` under-reports Implementation Details; the
-    matching ``hidden_info_k`` segment is authoritative when the two disagree.
+    On the reliability of the source columns: ``hidden_categories_k`` and
+    ``hidden_info_k`` agree on every *named* segment in all 500 rows. The one
+    defect is that the Implementation Details probe lost its category name
+    upstream (see ``HEADLESS_PROBE_PREFIX``), which both columns reflect
+    identically -- so it is repaired here rather than treated as a reason to
+    distrust either column. ``repaired`` flags the rows where that happened.
     """
     if dataset != MISSING_INFO:
         raise ValueError(f"{dataset!r} carries no masking answer key")
@@ -270,9 +321,16 @@ def load_answer_keys(
 
     keys: dict[str, dict[str, Any]] = {}
     for raw in _load_workbook():
+        hidden, repaired = parse_hidden_info(raw.get(f"hidden_info_{variant}"))
+        categories = split_categories(raw.get(f"hidden_categories_{variant}"))
+        for segment in hidden:
+            if segment["category"] not in categories:
+                categories.append(segment["category"])
         keys[raw["instance_id"]] = {
             "instance_id": raw["instance_id"],
-            "hidden_categories": split_categories(raw.get(f"hidden_categories_{variant}")),
+            "hidden_categories": categories,
+            "hidden": hidden,
+            "repaired": repaired,
             "hidden_info": raw.get(f"hidden_info_{variant}"),
             "present_categories": split_categories(raw.get("present_categories")),
             "category_mapping": raw.get("category_mapping"),
