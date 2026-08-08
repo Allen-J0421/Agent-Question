@@ -811,13 +811,13 @@ def build_keys(instance_ids: set[str], warnings: list[str]) -> dict[str, dict]:
         return {}
 
     keys: dict[str, dict] = {}
-    repaired = 0
+    repaired_ids: list[str] = []
     for instance_id in sorted(instance_ids):
         swe_row = swe.get(instance_id) or {}
         mi_row = mi.get(instance_id) or {}
         key = answer_keys.get(instance_id) or {}
         if key.get("repaired"):
-            repaired += 1
+            repaired_ids.append(instance_id)
         baselines = key.get("baselines") or {}
         keys[instance_id] = {
             # original_issue is byte-identical across both datasets (verified
@@ -834,11 +834,19 @@ def build_keys(instance_ids: set[str], warnings: list[str]) -> dict[str, dict]:
                 "grpo": baselines.get("grpo"),
             },
         }
-    if repaired:
+    if repaired_ids:
         warnings.append(
-            f"{repaired} instance(s) needed the Implementation Details label "
-            "repair (the probe lost its category name upstream); category "
-            "counts read from hidden_categories_3 alone would undercount them"
+            {
+                "text": (
+                    f"{len(repaired_ids)} instance(s) needed the Implementation "
+                    "Details label repair (the probe lost its category name "
+                    "upstream); category counts read from hidden_categories_3 "
+                    "alone would undercount them"
+                ),
+                # The ids are what turns this from "something is broken
+                # somewhere" into a list the reader can click through.
+                "instances": repaired_ids,
+            }
         )
     return keys
 
@@ -871,6 +879,36 @@ def check_masking(runs: list[dict], keys: dict[str, dict]) -> list[str]:
     return problems
 
 
+def normalize_warning(warning: Any, runs: list[dict]) -> dict:
+    """Give every build warning the same shape: ``{text, instances, runs}``.
+
+    Most warnings are bare strings raised far from here, so the page would have
+    to special-case two shapes to render them. Normalising once keeps the
+    template's job to display-only. Warnings that name instances get the
+    matching runs resolved to ``short_id``/``condition``/``model`` so the reader
+    can locate the affected rows instead of guessing what the warning covers.
+    """
+    if isinstance(warning, str):
+        return {"text": warning, "instances": [], "runs": []}
+
+    instances = list(warning.get("instances") or [])
+    affected = set(instances)
+    return {
+        "text": warning.get("text", ""),
+        "instances": instances,
+        "runs": [
+            {
+                "short_id": run.get("short_id"),
+                "instance_id": run["instance_id"],
+                "condition": run.get("condition"),
+                "model": run.get("model"),
+            }
+            for run in runs
+            if run["instance_id"] in affected
+        ],
+    }
+
+
 def build_payload(logs: Path) -> dict:
     summaries, errors = study_log.load_run_summaries(logs)
     # attach_evaluations is pure -- it returns a NEW list. Ignoring the return
@@ -898,6 +936,7 @@ def build_payload(logs: Path) -> dict:
     # time the meta block reads it, rather than depending on evaluation order.
     keys = build_keys({r["instance_id"] for r in runs}, warnings)
     warnings.extend(check_masking(runs, keys))
+    warnings = [normalize_warning(w, runs) for w in warnings]
     return {
         "meta": {
             "generated_at": study_log.utc_now(),
@@ -957,7 +996,9 @@ def main() -> int:
     if warnings:
         print(f"  {len(warnings)} build warning(s):")
         for warning in warnings[:10]:
-            print(f"    - {warning}")
+            print(f"    - {warning['text']}")
+            for instance_id in warning["instances"]:
+                print(f"        · {instance_id}")
         if len(warnings) > 10:
             print(f"    … and {len(warnings) - 10} more (shown in the page)")
     else:

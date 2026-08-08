@@ -40,6 +40,7 @@ from study_log import (
     load_run_summaries,
     preserve_codex_session_artifacts,
     preserve_session_artifacts,
+    prompt_hash,
     write_evaluation,
     write_run_summary,
 )
@@ -233,15 +234,59 @@ def dataset_of(summary: dict[str, Any]) -> str:
     return DEFAULT_DATASET
 
 
-def completed_run_keys(logs_root: Path) -> set[tuple[str, str, str]]:
-    """Return completed (instance, condition, model) runs from immutable summaries.
+def normalize_prompt(text: str) -> str:
+    """Collapse the differences that carry no experimental meaning.
 
-    The key stays ``(instance, condition, model)`` across both datasets because
-    the ``mi_*`` condition names are distinct, so a missing-info run never
-    marks the matching interactive-swe run complete.
+    The two datasets store the same GitHub issues but round-tripped through
+    different tooling, so 252 of 500 full-condition prompts differ only in line
+    endings and trailing spaces. Comparing raw text (or its sha256) would call
+    those 252 distinct tasks; comparing normalized text calls all 500 what they
+    are -- the same issue, presented identically to the model.
+    """
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def equivalence_key(row: dict[str, Any], condition: str) -> tuple[str, ...]:
+    """Identify a session by what actually defines it, not by its label.
+
+    ``full`` and ``mi_full`` show the model the same original issue at the same
+    commit, so a run of one is a run of the other and repeating it measures
+    sampling noise rather than any manipulation. Both therefore collapse onto a
+    single ``full`` key.
+
+    The ambiguous conditions never collapse: ``problem_statement`` and
+    ``rewrite_3`` are independently written rewrites -- verified to differ on
+    all 500 instances -- and telling them apart is the point of the study.
+    """
+    kind = "full" if condition.endswith("full") else condition
+    if kind != "full":
+        # Ambiguous conditions stay keyed on their own name, so a
+        # missing-info rewrite can never satisfy an interactive-swe one.
+        return (row["instance_id"], kind)
+    return (
+        row["instance_id"],
+        kind,
+        row["repo"],
+        row["base_commit"],
+        prompt_hash(normalize_prompt(build_prompt(row, condition))),
+    )
+
+
+def completed_run_keys(
+    logs_root: Path, rows_by_dataset: dict[str, dict[str, dict[str, Any]]] | None = None
+) -> set[tuple[Any, ...]]:
+    """Return completed runs keyed by what defines the experiment, plus model.
+
+    Keying on ``equivalence_key`` rather than the condition *name* is what lets
+    a finished ``full`` run satisfy ``mi_full`` (and vice versa) when the
+    instance, repository, commit and prompt all match, while keeping the two
+    ambiguous conditions strictly separate.
     """
     summaries, _ = load_run_summaries(logs_root)
-    completed: set[tuple[str, str, str]] = set()
+    if rows_by_dataset is None:
+        rows_by_dataset = {dataset: load_rows(dataset) for dataset in DATASETS}
+    completed: set[tuple[Any, ...]] = set()
     for summary in summaries:
         task = summary.get("task", {})
         process = summary.get("process", {})
@@ -261,29 +306,82 @@ def completed_run_keys(logs_root: Path) -> set[tuple[str, str, str]]:
         # instance forever.
         if summary.get("session", {}).get("ran_meaningfully") is False:
             continue
-        if (
+        if not (
             isinstance(instance_id, str)
             and condition in CONDITION_FIELD
             and isinstance(model, str)
         ):
-            completed.add((instance_id, condition, model))
+            continue
+        # Build the key from the row this run actually used. A run whose row is
+        # no longer loadable still marks its own (instance, condition) done, so
+        # a dataset gap can never cause a silent re-run.
+        rows = rows_by_dataset.get(dataset_of(summary)) or {}
+        row = rows.get(instance_id)
+        try:
+            key = equivalence_key(row, condition) if row else (instance_id, condition)
+        except (KeyError, ValueError):
+            key = (instance_id, condition)
+        completed.add((*key, model))
     return completed
+
+
+def equivalent_completed_run(
+    logs_root: Path, row: dict[str, Any], condition: str, model: str
+) -> dict[str, Any] | None:
+    """Find a finished run that already covers this exact task, if any.
+
+    Used to explain a skip in human terms; the batch selector itself works off
+    the key set rather than this lookup.
+    """
+    try:
+        wanted = equivalence_key(row, condition)
+    except (KeyError, ValueError):
+        return None
+    summaries, _ = load_run_summaries(logs_root)
+    rows_by_dataset = {dataset: load_rows(dataset) for dataset in DATASETS}
+    for summary in summaries:
+        task = summary.get("task", {})
+        if agent_info(summary).get("model") != model:
+            continue
+        if summary.get("process", {}).get("stop_reason") == "launch_error":
+            continue
+        if summary.get("session", {}).get("ran_meaningfully") is False:
+            continue
+        dataset = dataset_of(summary)
+        other = (rows_by_dataset.get(dataset) or {}).get(task.get("instance_id"))
+        other_condition = task.get("condition")
+        if not other or other_condition not in CONDITION_FIELD:
+            continue
+        try:
+            if equivalence_key(other, other_condition) == wanted:
+                return {
+                    "run_id": summary.get("run_id", "?"),
+                    "condition": other_condition,
+                    "dataset": dataset,
+                }
+        except (KeyError, ValueError):
+            continue
+    return None
 
 
 def select_batch_rows(
     rows: list[dict[str, Any]],
-    completed: set[tuple[str, str, str]],
+    completed: set[tuple[Any, ...]],
     conditions: tuple[str, ...],
     model: str,
     count: int,
 ) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
-    """Select the next incomplete dataset instances in deterministic dataset order."""
+    """Select the next incomplete dataset instances in deterministic dataset order.
+
+    A condition counts as done when an equivalent session already exists, which
+    for the full conditions can be one recorded under the other dataset's name.
+    """
     selected: list[tuple[dict[str, Any], tuple[str, ...]]] = []
     for row in rows:
         missing = tuple(
             condition
             for condition in conditions
-            if (row["instance_id"], condition, model) not in completed
+            if (*equivalence_key(row, condition), model) not in completed
         )
         if missing:
             selected.append((row, missing))
@@ -464,6 +562,21 @@ def command_run(args: argparse.Namespace) -> None:
     print(f"Field:     {field}")
     print(f"Model:     {args.model}")
     print(f"Runner:    {runner}")
+
+    # `batch` skips equivalent sessions outright; a single explicit `run` is a
+    # deliberate act, so it only warns -- re-running one on purpose stays possible.
+    duplicate = equivalent_completed_run(
+        Path(args.logs_dir) if args.logs_dir else default_logs_root(),
+        row, args.condition, args.model,
+    )
+    if duplicate:
+        print(
+            f"\nNOTE: {duplicate['run_id'][:8]} already ran this exact task "
+            f"(recorded as {duplicate['condition']} under {duplicate['dataset']}). "
+            "The prompt, repository and commit are identical, so this session would "
+            "measure sampling noise rather than a new condition."
+        )
+
     print("\n--- EXACT AGENT PROMPT ---")
     print(prompt)
     print("--- END PROMPT ---\n")
@@ -756,6 +869,13 @@ def command_batch(args: argparse.Namespace) -> None:
         )
 
     session_count = sum(len(missing) for _, missing in selected)
+    # Name the conditions that dropped out, so a `--condition both` batch that
+    # yields only ambiguous sessions reads as reuse rather than a bug.
+    reused = [
+        condition
+        for condition in conditions
+        if not any(condition in missing for _, missing in selected)
+    ]
     print(
         f"Batch: {len(selected)} dataset instances, {session_count} session(s), "
         f"dataset={args.dataset}, condition={args.condition}, model={args.model} "
@@ -763,6 +883,13 @@ def command_batch(args: argparse.Namespace) -> None:
         f"{len(rows)} runnable instances in the dataset)",
         flush=True,
     )
+    if reused:
+        print(
+            f"Reusing existing runs for {', '.join(reused)}: an equivalent session "
+            "(same instance, repository, commit and prompt) is already recorded "
+            "for this model, so no new session is needed.",
+            flush=True,
+        )
     # Certify the ask channel before spending a batch of sessions on it.
     if not args.dry_run and not args.skip_preflight:
         run_preflight(args.model)

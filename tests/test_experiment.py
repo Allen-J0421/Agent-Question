@@ -300,3 +300,71 @@ def test_resume_state_is_keyed_per_model_across_both_record_generations(tmp_path
         ("one", "ambiguous", "claude-opus-4-8"),
         ("one", "ambiguous", "gpt-5.6-sol"),
     }
+
+
+def test_full_conditions_share_one_equivalence_key_but_ambiguous_do_not():
+    # full and mi_full present the same original issue at the same commit, so
+    # a run of one IS a run of the other. The ambiguous conditions are
+    # independently written rewrites and must never satisfy each other.
+    from experiment import equivalence_key
+
+    isw = {
+        "instance_id": "owner__repo-1", "repo": "owner/repo",
+        "base_commit": "0123456789abcdef",
+        "problem_statement": "SWE REWRITE", "original_issue": "FULL TEXT",
+    }
+    mi = {**isw, "rewrite_3": "MI REWRITE"}
+
+    assert equivalence_key(isw, "full") == equivalence_key(mi, "mi_full")
+    assert equivalence_key(isw, "ambiguous") != equivalence_key(mi, "mi_ambiguous")
+
+
+def test_full_equivalence_ignores_whitespace_only_differences():
+    # The two datasets round-tripped the same issues through different tooling:
+    # 252 of 500 full prompts differ only in line endings and trailing spaces.
+    # Keying on raw text would call those distinct tasks and re-run them.
+    from experiment import equivalence_key
+
+    base = {"instance_id": "owner__repo-1", "repo": "owner/repo",
+            "base_commit": "0123456789abcdef"}
+    crlf = {**base, "original_issue": "line one  \r\nline two\r\n"}
+    lf = {**base, "original_issue": "line one\nline two"}
+
+    assert equivalence_key(crlf, "full") == equivalence_key(lf, "mi_full")
+
+
+def test_a_finished_full_run_satisfies_the_other_datasets_full_condition(tmp_path):
+    # The reported bug: a completed interactive-swe/full run did not stop
+    # `--dataset missing-info --condition both` from spending a duplicate
+    # mi_full session that measured only sampling noise.
+    import json
+
+    from experiment import completed_run_keys, select_batch_rows
+
+    isw = {"instance_id": "owner__repo-1", "repo": "owner/repo",
+           "base_commit": "0123456789abcdef",
+           "problem_statement": "SWE REWRITE", "original_issue": "FULL TEXT"}
+    mi = {**isw, "rewrite_3": "MI REWRITE"}
+    rows = {"interactive-swe": {isw["instance_id"]: isw},
+            "missing-info": {mi["instance_id"]: mi}}
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / "done.json").write_text(json.dumps({
+        "run_id": "done",
+        "task": {"instance_id": "owner__repo-1", "condition": "full",
+                 "dataset": "interactive-swe"},
+        "agent": {"model": "gpt-5.6-sol", "runner": "codex-cli"},
+        "process": {"stop_reason": "completed"},
+        "session": {"ran_meaningfully": True},
+    }))
+    completed = completed_run_keys(tmp_path, rows)
+
+    selected = select_batch_rows(
+        [mi], completed, ("mi_ambiguous", "mi_full"), "gpt-5.6-sol", 1
+    )
+    assert [missing for _, missing in selected] == [("mi_ambiguous",)]
+
+    # A different model is untouched by the reuse.
+    other = select_batch_rows([mi], completed, ("mi_full",), "claude-opus-4-8", 1)
+    assert [missing for _, missing in other] == [("mi_full",)]
